@@ -347,10 +347,11 @@ local defaults = {
 -- Runtime state
 -- ============================================================
 
-local cache        = {}     -- [playerName] = data record
-local inspQueue    = {}     -- list of unit tokens queued for inspection
-local inspecting   = nil    -- unit token currently being inspected
-local inspTimer    = nil    -- timeout timer handle
+local cache              = {}     -- [playerName] = data record
+local inspQueue          = {}     -- list of unit tokens queued for inspection
+local inspecting         = nil    -- unit token currently being inspected
+local inspTimer          = nil    -- timeout timer handle
+local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
 
 -- Hidden tooltip used to count socket slots on item links
 local scanTip = CreateFrame("GameTooltip", "RaidInspect_ScanTip",
@@ -602,11 +603,13 @@ local function CollectData(unit)
     end
 
     -- Glyph data (major + minor, sockets 1-6)
-    -- GetGlyphSocketInfo returns: enabled, glyphType, glyphSpellID, icon
+    -- GetGlyphSocketInfo(socketID, talentGroup, isInspect) — WotLK 3.3.5 API.
+    -- Pass isnotplayer as the isInspect flag so that we read the INSPECTED
+    -- unit's glyphs rather than always reading the local player's own glyphs.
     -- glyphType == 1 → Major glyph; glyphType == 2 → Minor glyph
     local glyphs = {}
     for socket = 1, 6 do
-        local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
+        local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket, 1, isnotplayer)
         if glyphSpellID and glyphSpellID > 0 then
             glyphs[socket] = {
                 spellID   = glyphSpellID,
@@ -636,7 +639,17 @@ end
 -- ============================================================
 
 local function NextInspect()
-    if #inspQueue == 0 then inspecting = nil; return end
+    if #inspQueue == 0 then
+        inspecting = nil
+        -- When the queue drains, send a group-wide data+glyph request if any
+        -- player was skipped (out of range) or had missing/changed data.
+        if pendingCommRequest then
+            pendingCommRequest = false
+            RaidInspect:RequestData(true)   -- silent = true (no chat spam)
+            RaidInspect:RequestGlyphs(true)
+        end
+        return
+    end
 
     local unit = table.remove(inspQueue, 1)
 
@@ -655,6 +668,10 @@ local function NextInspect()
     end
 
     if not UnitExists(unit) or not CanInspect(unit) then
+        -- Player is out of range or offline.  Flag a deferred comm request so
+        -- that when the queue empties we ask group members running the addon to
+        -- share their own data (covers the out-of-range case).
+        pendingCommRequest = true
         -- Schedule asynchronously to avoid deep recursion when many players
         -- are out of range or offline; a 0-second timer fires on the next frame.
         RaidInspect:ScheduleTimer(NextInspect, 0)
@@ -686,7 +703,8 @@ function RaidInspect:ScanRaid()
     wipe(inspQueue)
     wipe(cache)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
-    inspecting = nil
+    inspecting         = nil
+    pendingCommRequest = false
 
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
@@ -713,6 +731,30 @@ function RaidInspect:ScanRaid()
     self:Print(string.format("Queueing %d member(s) for inspection…", total))
 end
 
+-- AutoScan enqueues current group members WITHOUT wiping the cache.
+-- Called automatically on group roster changes so that new members are
+-- picked up and changed players are re-inspected incrementally.
+function RaidInspect:AutoScan()
+    local numRaid = GetNumRaidMembers()
+    if numRaid > 0 then
+        for i = 1, numRaid do
+            local unit = "raid"..i
+            if UnitExists(unit) and UnitIsPlayer(unit) then
+                Enqueue(UnitIsUnit(unit, "player") and "player" or unit)
+            end
+        end
+    else
+        Enqueue("player")
+        local numParty = GetNumPartyMembers()
+        for i = 1, numParty do
+            local unit = "party"..i
+            if UnitExists(unit) and UnitIsPlayer(unit) then
+                Enqueue(unit)
+            end
+        end
+    end
+end
+
 -- ============================================================
 -- Event: inspection data ready
 -- ============================================================
@@ -725,6 +767,28 @@ function RaidInspect:INSPECT_READY(_, guid)
 
     local data = CollectData(inspecting)
     if data then
+        local oldData = cache[data.name]
+
+        -- Decide whether a group-wide comm request is needed for this player.
+        -- Request if: glyphs are missing after inspection, OR gear/talents
+        -- changed since the last scan (the remote data may have newer glyphs).
+        if not pendingCommRequest then
+            if not data.glyphs or not next(data.glyphs) then
+                pendingCommRequest = true
+            elseif oldData then
+                if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
+                    pendingCommRequest = true
+                elseif oldData.talentData and data.talentData then
+                    for i = 1, 3 do
+                        if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
+                            pendingCommRequest = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
         cache[data.name] = data
         self:RefreshTable()
     end
@@ -820,21 +884,27 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
     end
 end
 
-function RaidInspect:RequestGlyphs()
+-- silent suppresses the chat confirmation (used for auto-triggered requests)
+function RaidInspect:RequestGlyphs(silent)
     local numRaid = GetNumRaidMembers()
     local channel = numRaid > 0 and "RAID" or "PARTY"
     self:SendCommMessage(COMM_PREFIX, GLYPH_REQ_MSG, channel)
-    self:Print("Requested glyph data from raid/party members running RaidInspect.")
+    if not silent then
+        self:Print("Requested glyph data from raid/party members running RaidInspect.")
+    end
 end
 
 -- Broadcasts a full-data request to all group members running RaidInspect.
 -- Each responding client sends back their own gear, talents, and glyphs so
 -- that players who are out of inspect range can still be shown in the table.
-function RaidInspect:RequestData()
+-- silent suppresses the chat confirmation (used for auto-triggered requests)
+function RaidInspect:RequestData(silent)
     local numRaid = GetNumRaidMembers()
     local channel = numRaid > 0 and "RAID" or "PARTY"
     self:SendCommMessage(COMM_PREFIX, DATA_REQ_MSG, channel)
-    self:Print("Requested gear/talent data from raid/party members running RaidInspect.")
+    if not silent then
+        self:Print("Requested gear/talent data from raid/party members running RaidInspect.")
+    end
 end
 
 -- ============================================================
@@ -1835,6 +1905,10 @@ end
 
 function RaidInspect:OnEnable()
     self:RegisterEvent("INSPECT_READY")
+    -- Automatically re-scan whenever the group roster changes so that new
+    -- members are inspected without requiring a manual /ri scan.
+    self:RegisterEvent("RAID_ROSTER_UPDATE")
+    self:RegisterEvent("PARTY_MEMBERS_CHANGED")
     self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri data · /ri config")
 end
 
@@ -1842,7 +1916,17 @@ function RaidInspect:OnDisable()
     wipe(cache)
     wipe(inspQueue)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
-    inspecting = nil
+    inspecting         = nil
+    pendingCommRequest = false
+end
+
+-- Auto-scan handlers — fired by the server when group membership changes.
+function RaidInspect:RAID_ROSTER_UPDATE()
+    self:AutoScan()
+end
+
+function RaidInspect:PARTY_MEMBERS_CHANGED()
+    self:AutoScan()
 end
 
 function RaidInspect:SlashCommand(input)
