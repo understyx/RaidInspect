@@ -640,9 +640,10 @@ local function NextInspect()
 
     local unit = table.remove(inspQueue, 1)
 
-    -- The "player" unit is always accessible without a server-side inspect request.
-    -- CanInspect("player") returns false in WotLK, so bypass the queue mechanism.
-    if unit == "player" then
+    -- The local player is always accessible without a server-side inspect request.
+    -- CanInspect returns false for yourself regardless of unit token, so bypass the
+    -- queue mechanism.  The token may be "player" (solo/party) or "raidN" (raid group).
+    if unit == "player" or UnitIsUnit(unit, "player") then
         local data = CollectData("player")
         if data then
             cache[data.name] = data
@@ -692,7 +693,9 @@ function RaidInspect:ScanRaid()
         for i = 1, numRaid do
             local unit = "raid"..i
             if UnitExists(unit) and UnitIsPlayer(unit) then
-                Enqueue(unit)
+                -- Use "player" token for the local player so NextInspect can
+                -- bypass CanInspect (which always returns false for yourself).
+                Enqueue(UnitIsUnit(unit, "player") and "player" or unit)
             end
         end
     else
