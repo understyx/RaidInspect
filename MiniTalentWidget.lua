@@ -7,14 +7,63 @@ local addonName, ns = ...
 -- Adapted from the WeakAuras MiniTalent widget pattern.
 -- ==========================================================
 
-local widgetType, widgetVersion = "AuraTrackerMiniTalent", 1
+local widgetType, widgetVersion = "AuraTrackerMiniTalent", 2
 local AceGUI = LibStub and LibStub("AceGUI-3.0", true)
 if not AceGUI or (AceGUI:GetWidgetVersion(widgetType) or 0) >= widgetVersion then
     return
 end
 
+local LGT = LibStub and LibStub("LibGroupTalents-1.0", true)
+
 local ceil = math.ceil
 local pairs, ipairs = pairs, ipairs
+
+-- All WotLK playable classes in display order
+local ALL_CLASSES = {
+    "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
+    "DEATHKNIGHT", "SHAMAN", "MAGE", "WARLOCK", "DRUID",
+}
+
+-- ==========================================================
+-- BUILD TALENT LIST FROM CLASS DATA
+-- ==========================================================
+
+-- Builds the list table expected by TalentFrame_Update from the
+-- LibGroupTalents classTalentData cache for a given class.
+-- Returns (list, numTabs) or (nil, 0) when data is not yet loaded.
+local function BuildListForClass(class)
+    if not LGT then return nil, 0 end
+    local data = LGT.classTalentData and LGT.classTalentData[class]
+    if not data then return nil, 0 end
+
+    local list      = {}
+    local maxTalents = MAX_NUM_TALENTS or 30
+    local numTabs   = 0
+
+    for treeIndex = 1, #data do
+        local tree = data[treeIndex]
+        if tree and tree.list then
+            numTabs = treeIndex
+            for _, entry in ipairs(tree.list) do
+                local idx = (treeIndex - 1) * maxTalents + entry.index
+                list[idx] = { entry.icon, entry.tier, entry.column, entry.name, entry.maxRank }
+            end
+        end
+    end
+
+    if numTabs == 0 then return nil, 0 end
+
+    -- Background textures are stored at the sentinel index
+    local bgIndex = maxTalents * numTabs + 1
+    list[bgIndex] = {}
+    for tab = 1, numTabs do
+        if data[tab] then
+            list[bgIndex][tab] = data[tab].background
+        end
+    end
+
+    return list, numTabs
+end
 
 local buttonSize = 32
 local buttonSizePadded = 45
@@ -104,13 +153,19 @@ local function CreateTalentButton(parent)
         else
             self:SetValue(true)
         end
-        self.obj.obj:Fire("OnValueChanged", self.index, self.state)
+        -- button.obj = talentFrame; talentFrame.obj = AceGUI widget
+        -- Pass talentName so callers can save/restore by name across classes
+        self.obj.obj:Fire("OnValueChanged", self.index, self.state, self.talentName)
     end)
 
     button:SetScript("OnEnter", function(self)
-        if self.tab and self.talentIndex then
+        if self.talentName then
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            GameTooltip:SetTalent(self.tab, self.talentIndex)
+            GameTooltip:AddLine(self.talentName, 1, 1, 1)
+            if self.maxRank then
+                GameTooltip:AddLine("Max Rank: " .. self.maxRank, 0.8, 0.8, 0.8)
+            end
+            GameTooltip:Show()
         end
     end)
 
@@ -134,10 +189,11 @@ local function TalentFrame_Update(self)
             if not data then
                 button:Hide()
             else
-                local icon, tier, column, talentName = unpack(data)
-                button.tier = tier
-                button.column = column
+                local icon, tier, column, talentName, maxRank = unpack(data)
+                button.tier       = tier
+                button.column     = column
                 button.talentName = talentName
+                button.maxRank    = maxRank
                 button:SetNormalTexture(icon)
                 button:UpdateTexture()
                 button:ClearAllPoints()
@@ -178,10 +234,12 @@ local function TalentFrame_Update(self)
         end
     end
 
-    -- Update background textures
+    -- Update background textures using the class-specific numTabs, not the
+    -- player's own GetNumTalentTabs() which would be wrong for other classes.
     if self.list then
-        local numTabs = GetNumTalentTabs and GetNumTalentTabs() or 0
-        local backgroundIndex = MAX_NUM_TALENTS * numTabs + 1
+        local numTabs        = self.numTabs or 0
+        local maxTalents     = MAX_NUM_TALENTS or 30
+        local backgroundIndex = maxTalents * numTabs + 1
         for tab = 1, numTabs do
             local background = self.backgrounds[tab]
             if background then
@@ -210,18 +268,52 @@ local methods = {
     OnAcquire = function(self)
         self:SetDisabled(false)
         self.acquired = true
+        -- Default to the current player's class so the widget is immediately useful
+        local _, playerClass = UnitClass("player")
+        if playerClass then
+            self:SetClass(playerClass)
+        end
     end,
 
     OnRelease = function(self)
         self:SetDisabled(true)
         self:SetMultiselect(false)
-        self.value = nil
-        self.list = nil
+        self.value   = nil
+        self.list    = nil
+        self.class   = nil
+        self.numTabs = nil
         self.acquired = false
     end,
 
     SetList = function(self, list)
         self.list = list or {}
+        TalentFrame_Update(self)
+    end,
+
+    -- Switch the talent tree to the given WoW class identifier (e.g. "PALADIN").
+    -- Builds the talent list from LibGroupTalents' classTalentData cache and
+    -- updates the class-dropdown label.  When data for the class is not yet
+    -- loaded (no player of that class has been inspected), the tree is left
+    -- empty; inspect a player of the target class to populate it.
+    SetClass = function(self, class)
+        if not class then return end
+        self.class = class
+        local displayName = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[class]) or class
+        UIDropDownMenu_SetText(self.classDropdown, displayName)
+        local newList, numTabs = BuildListForClass(class)
+        self.numTabs = numTabs
+        self:SetList(newList)
+    end,
+
+    -- Restore per-talent filter states from a name→state table.
+    -- Called after SetClass to reinstate saved required/excluded flags.
+    RestoreValues = function(self, filterTable)
+        filterTable = filterTable or {}
+        for _, button in ipairs(self.buttons) do
+            if button.talentName ~= nil then
+                button:SetValue(filterTable[button.talentName])
+            end
+        end
         TalentFrame_Update(self)
     end,
 
@@ -235,11 +327,13 @@ local methods = {
             end
             self.open = nil
             self.toggleButton:Hide()
+            self.classDropdown:Hide()
             self.frame:Hide()
         else
             self.open = nil
             TalentFrame_Update(self)
             self.toggleButton:Show()
+            self.classDropdown:Show()
             self.frame:Show()
         end
     end,
@@ -251,8 +345,8 @@ local methods = {
         end
     end,
 
-    SetValue = function(self, value) end,
-    SetLabel = function(self, text) end,
+    SetValue      = function(self, value) end,
+    SetLabel      = function(self, text) end,
     SetMultiselect = function(self, multi) end,
 
     ToggleView = function(self)
@@ -278,14 +372,16 @@ local function Constructor()
     local talentFrame = CreateFrame("Button", name, UIParent)
     talentFrame:SetFrameStrata("FULLSCREEN_DIALOG")
 
-    -- Create talent buttons
-    local numTabs = GetNumTalentTabs and GetNumTalentTabs() or 3
+    -- Always create buttons for 3 tabs × 30 talents (WotLK maximum).
+    -- The displayed content is driven by SetClass / SetList, not by the
+    -- current player's GetNumTalentTabs().
+    local numTabs    = 3
     local maxTalents = MAX_NUM_TALENTS or 30
-    local buttons = {}
+    local buttons    = {}
     for i = 1, maxTalents * numTabs do
         local button = CreateTalentButton(talentFrame)
-        button.index = i
-        button.tab = ceil(i / maxTalents)
+        button.index       = i
+        button.tab         = ceil(i / maxTalents)
         button.talentIndex = i - (button.tab - 1) * maxTalents
         table.insert(buttons, button)
     end
@@ -295,18 +391,20 @@ local function Constructor()
     local backgrounds = {}
     for tab = 1, numTabs do
         local background = talentFrame:CreateTexture(nil, "BACKGROUND")
-        background:SetPoint("TOPLEFT", talentFrame, "TOPLEFT", (tab - 1) * buttonSizePadded * bgColMultiplier, 0)
-        background:SetPoint("BOTTOMRIGHT", talentFrame, "BOTTOMLEFT", tab * buttonSizePadded * bgColMultiplier, 0)
+        background:SetPoint("TOPLEFT",     talentFrame, "TOPLEFT",
+                            (tab - 1) * buttonSizePadded * bgColMultiplier, 0)
+        background:SetPoint("BOTTOMRIGHT", talentFrame, "BOTTOMLEFT",
+                            tab * buttonSizePadded * bgColMultiplier, 0)
         background:SetTexCoord(0, 1, 0, 1)
         background:Show()
         table.insert(backgrounds, background)
     end
 
     -- Scale to fit settings panel
-    local width = buttonSizePadded * columnsPerTab * numTabs + 10
-    local height = buttonSizePadded * 11 + 10
+    local width      = buttonSizePadded * columnsPerTab * numTabs + 10
+    local height     = buttonSizePadded * 11 + 10
     local finalWidth = 440
-    local scale = finalWidth / width
+    local scale      = finalWidth / width
     local finalHeight = height * scale
 
     for _, button in ipairs(buttons) do
@@ -328,16 +426,25 @@ local function Constructor()
     end)
     toggleButton:Show()
 
-    -- Assemble widget
+    -- Class selector dropdown — lets users pick any WotLK class so that
+    -- talent profiles can be created without being that class yourself.
+    local classDropdown = CreateFrame("Frame", name .. "ClassDropdown", talentFrame,
+                                      "UIDropDownMenuTemplate")
+    UIDropDownMenu_SetWidth(classDropdown, 120)
+    UIDropDownMenu_SetText(classDropdown, "Select Class")
+    classDropdown:SetPoint("BOTTOMLEFT", talentFrame, "TOPLEFT", -16, 2)
+
+    -- Assemble widget before initialising the dropdown so talentFrame.obj is set
     local widget = {
-        frame = talentFrame,
-        type = widgetType,
-        buttons = buttons,
+        frame        = talentFrame,
+        type         = widgetType,
+        buttons      = buttons,
         toggleButton = toggleButton,
-        backgrounds = backgrounds,
+        classDropdown = classDropdown,
+        backgrounds  = backgrounds,
         saveSize = {
-            fullWidth = finalWidth,
-            fullHeight = finalHeight,
+            fullWidth          = finalWidth,
+            fullHeight         = finalHeight,
             collapsedRowHeight = (buttonSizePadded + 5) * scale,
         },
     }
@@ -347,6 +454,22 @@ local function Constructor()
     end
 
     talentFrame.obj = widget
+
+    UIDropDownMenu_Initialize(classDropdown, function(self, level)
+        for _, class in ipairs(ALL_CLASSES) do
+            local capturedClass = class
+            local info  = UIDropDownMenu_CreateInfo()
+            info.text   = (LOCALIZED_CLASS_NAMES_MALE and LOCALIZED_CLASS_NAMES_MALE[class]) or class
+            info.value  = class
+            info.func   = function()
+                if talentFrame.obj then
+                    talentFrame.obj:SetClass(capturedClass)
+                end
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    classDropdown:Show()
 
     return AceGUI:RegisterAsWidget(widget)
 end
