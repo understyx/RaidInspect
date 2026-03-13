@@ -350,7 +350,8 @@ local defaults = {
 local cache              = {}     -- [playerName] = data record
 local inspQueue          = {}     -- list of unit tokens queued for inspection
 local inspecting         = nil    -- unit token currently being inspected
-local inspTimer          = nil    -- timeout timer handle
+local inspTimer          = nil    -- timeout timer handle (5-second failsafe)
+local inspDelayTimer     = nil    -- handle for the 0.5-second inter-inspect delay timer
 local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
 
 -- Hidden tooltip used to count socket slots on item links
@@ -638,6 +639,19 @@ end
 -- Inspect queue
 -- ============================================================
 
+-- Schedule the next inspection step after a short delay.
+-- Cancels any already-pending delay timer first so that only one
+-- NextInspect chain is ever active at a time.
+local function scheduleNextInspect(delay)
+    if inspDelayTimer then
+        RaidInspect:CancelTimer(inspDelayTimer)
+    end
+    inspDelayTimer = RaidInspect:ScheduleTimer(function()
+        inspDelayTimer = nil
+        NextInspect()
+    end, delay or 0.5)
+end
+
 local function NextInspect()
     if #inspQueue == 0 then
         inspecting = nil
@@ -663,7 +677,7 @@ local function NextInspect()
             RaidInspect:RefreshTable()
         end
         -- Use the same inter-inspect delay as for other units.
-        RaidInspect:ScheduleTimer(NextInspect, 0.5)
+        scheduleNextInspect(0.5)
         return
     end
 
@@ -674,7 +688,7 @@ local function NextInspect()
         pendingCommRequest = true
         -- Schedule asynchronously to avoid deep recursion when many players
         -- are out of range or offline; a 0-second timer fires on the next frame.
-        RaidInspect:ScheduleTimer(NextInspect, 0)
+        scheduleNextInspect(0)
         return
     end
 
@@ -702,8 +716,10 @@ function RaidInspect:ScanRaid()
     wipe(inspQueue)
     wipe(cache)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
+    if inspDelayTimer then self:CancelTimer(inspDelayTimer); inspDelayTimer = nil end
     inspecting         = nil
     pendingCommRequest = false
+    self:RefreshTable()   -- immediately clear stale rows from any previous scan
 
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
@@ -753,7 +769,10 @@ function RaidInspect:AutoScan()
             end
         end
     end
-    if not inspecting then NextInspect() end
+    -- Only kick off a new chain if neither an active inspection nor a pending
+    -- inter-inspect delay is already running; the existing chain will pick up
+    -- any newly enqueued units on its own.
+    if not inspecting and not inspDelayTimer then NextInspect() end
 end
 
 -- ============================================================
@@ -798,7 +817,7 @@ function RaidInspect:INSPECT_READY(_, guid)
     inspecting = nil
 
     -- Small delay between inspects to respect server throttling
-    self:ScheduleTimer(NextInspect, 0.5)
+    scheduleNextInspect(0.5)
 end
 
 -- ============================================================
@@ -1917,6 +1936,7 @@ function RaidInspect:OnDisable()
     wipe(cache)
     wipe(inspQueue)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
+    if inspDelayTimer then self:CancelTimer(inspDelayTimer); inspDelayTimer = nil end
     inspecting         = nil
     pendingCommRequest = false
 end
