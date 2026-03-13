@@ -552,11 +552,18 @@ end
 -- ============================================================
 
 local function CollectData(unit)
-    if not unit or not UnitIsPlayer(unit) then return nil end
+    if not unit or not UnitIsPlayer(unit) then
+        RaidInspect:Print(string.format("[RI] CollectData('%s') – not a player unit, aborting", tostring(unit)))
+        return nil
+    end
 
     local name, realm = UnitName(unit)
     if realm and realm ~= "" then name = name.."-"..realm end
-    if not name or name == "Unknown" then return nil end
+    if not name or name == "Unknown" then
+        RaidInspect:Print(string.format("[RI] CollectData('%s') – name is '%s', aborting", tostring(unit), tostring(name)))
+        return nil
+    end
+    RaidInspect:Print(string.format("[RI] CollectData: collecting data for '%s'", tostring(name)))
 
     local _, class = UnitClass(unit)
     local guild     = GetGuildInfo(unit) or ""
@@ -620,6 +627,13 @@ local function CollectData(unit)
         end
     end
 
+    local glyphCount = 0
+    for _ in pairs(glyphs) do glyphCount = glyphCount + 1 end
+    RaidInspect:Print(string.format("[RI] CollectData: done for '%s' – gs=%.0f gems=%s enchants=%s talents=%d/%d/%d glyphs=%d",
+        name, gs,
+        missingGems and "missing" or "ok", missingEnchants and "missing" or "ok",
+        talentData[1] or 0, talentData[2] or 0, talentData[3] or 0,
+        glyphCount))
     return {
         name      = name,
         class     = class,
@@ -639,6 +653,11 @@ end
 -- Inspect queue
 -- ============================================================
 
+-- Forward declaration so that scheduleNextInspect's closure and the failsafe
+-- timer inside NextInspect both capture the same upvalue rather than trying
+-- to look up a global named "NextInspect" (which would be nil).
+local NextInspect
+
 -- Schedule the next inspection step after a short delay.
 -- Cancels any already-pending delay timer first so that only one
 -- NextInspect chain is ever active at a time.
@@ -652,13 +671,16 @@ local function scheduleNextInspect(delay)
     end, delay or 0.5)
 end
 
-local function NextInspect()
+NextInspect = function()
+    RaidInspect:Print(string.format("[RI] NextInspect called – queue=%d inspecting=%s", #inspQueue, tostring(inspecting)))
     if #inspQueue == 0 then
         inspecting = nil
+        RaidInspect:Print("[RI] Queue empty – scan complete")
         -- When the queue drains, send a group-wide data+glyph request if any
         -- player was skipped (out of range) or had missing/changed data.
         if pendingCommRequest then
             pendingCommRequest = false
+            RaidInspect:Print("[RI] Sending deferred comm request (data + glyphs)")
             RaidInspect:RequestData(true)   -- silent = true (no chat spam)
             RaidInspect:RequestGlyphs(true)
         end
@@ -666,22 +688,35 @@ local function NextInspect()
     end
 
     local unit = table.remove(inspQueue, 1)
+    RaidInspect:Print(string.format("[RI] Processing unit '%s' (queue remaining: %d)", tostring(unit), #inspQueue))
 
     -- The local player is always accessible without a server-side inspect request.
     -- CanInspect returns false for yourself regardless of unit token, so bypass the
     -- queue mechanism.  The token may be "player" (solo/party) or "raidN" (raid group).
     if unit == "player" or UnitIsUnit(unit, "player") then
+        RaidInspect:Print("[RI] Unit is local player – collecting data directly")
         local data = CollectData("player")
         if data then
             cache[data.name] = data
             RaidInspect:RefreshTable()
+            RaidInspect:Print(string.format("[RI] Collected local player data for '%s'", tostring(data.name)))
+        else
+            RaidInspect:Print("[RI] CollectData returned nil for local player")
         end
         -- Use the same inter-inspect delay as for other units.
         scheduleNextInspect(0.5)
         return
     end
 
-    if not UnitExists(unit) or not CanInspect(unit) then
+    if not UnitExists(unit) then
+        RaidInspect:Print(string.format("[RI] Unit '%s' does not exist – skipping", tostring(unit)))
+        pendingCommRequest = true
+        scheduleNextInspect(0)
+        return
+    end
+
+    if not CanInspect(unit) then
+        RaidInspect:Print(string.format("[RI] CanInspect('%s') = false (out of range?) – skipping", tostring(unit)))
         -- Player is out of range or offline.  Flag a deferred comm request so
         -- that when the queue empties we ask group members running the addon to
         -- share their own data (covers the out-of-range case).
@@ -693,11 +728,13 @@ local function NextInspect()
     end
 
     inspecting = unit
+    RaidInspect:Print(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(UnitGUID(unit))))
     NotifyInspect(unit)
 
     -- Failsafe timeout so we never get stuck
     if inspTimer then RaidInspect:CancelTimer(inspTimer) end
     inspTimer = RaidInspect:ScheduleTimer(function()
+        RaidInspect:Print(string.format("[RI] Inspect TIMEOUT for '%s' – moving on", tostring(inspecting)))
         ClearInspectPlayer()
         inspecting = nil
         NextInspect()
@@ -705,10 +742,17 @@ local function NextInspect()
 end
 
 local function Enqueue(unit)
-    if inspecting == unit then return end
-    for _, u in ipairs(inspQueue) do
-        if u == unit then return end
+    if inspecting == unit then
+        RaidInspect:Print(string.format("[RI] Enqueue('%s') – skipped, already inspecting", tostring(unit)))
+        return
     end
+    for _, u in ipairs(inspQueue) do
+        if u == unit then
+            RaidInspect:Print(string.format("[RI] Enqueue('%s') – skipped, already in queue", tostring(unit)))
+            return
+        end
+    end
+    RaidInspect:Print(string.format("[RI] Enqueue('%s') – added (queue size now %d)", tostring(unit), #inspQueue + 1))
     inspQueue[#inspQueue+1] = unit
 end
 
@@ -780,8 +824,15 @@ end
 -- ============================================================
 
 function RaidInspect:INSPECT_READY(_, guid)
-    if not inspecting then return end
-    if guid and guid ~= UnitGUID(inspecting) then return end
+    RaidInspect:Print(string.format("[RI] INSPECT_READY fired – guid=%s inspecting=%s", tostring(guid), tostring(inspecting)))
+    if not inspecting then
+        RaidInspect:Print("[RI] INSPECT_READY – no active inspection, ignoring")
+        return
+    end
+    if guid and guid ~= UnitGUID(inspecting) then
+        RaidInspect:Print(string.format("[RI] INSPECT_READY – GUID mismatch (expected %s, got %s), ignoring", tostring(UnitGUID(inspecting)), tostring(guid)))
+        return
+    end
 
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
 
@@ -794,13 +845,16 @@ function RaidInspect:INSPECT_READY(_, guid)
         -- changed since the last scan (the remote data may have newer glyphs).
         if not pendingCommRequest then
             if not data.glyphs or not next(data.glyphs) then
+                RaidInspect:Print(string.format("[RI] INSPECT_READY – '%s' has no glyphs, flagging deferred comm request", tostring(data.name)))
                 pendingCommRequest = true
             elseif oldData then
                 if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
+                    RaidInspect:Print(string.format("[RI] INSPECT_READY – '%s' gearscore changed (%.0f→%.0f), flagging deferred comm request", tostring(data.name), oldData.gearscore or 0, data.gearscore or 0))
                     pendingCommRequest = true
                 elseif oldData.talentData and data.talentData then
                     for i = 1, 3 do
                         if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
+                            RaidInspect:Print(string.format("[RI] INSPECT_READY – '%s' talent tree %d changed, flagging deferred comm request", tostring(data.name), i))
                             pendingCommRequest = true
                             break
                         end
@@ -811,6 +865,8 @@ function RaidInspect:INSPECT_READY(_, guid)
 
         cache[data.name] = data
         self:RefreshTable()
+    else
+        RaidInspect:Print(string.format("[RI] INSPECT_READY – CollectData returned nil for '%s'", tostring(inspecting)))
     end
 
     ClearInspectPlayer()
