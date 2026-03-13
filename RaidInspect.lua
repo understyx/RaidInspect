@@ -653,9 +653,10 @@ end
 -- Inspect queue
 -- ============================================================
 
--- Forward declaration so that scheduleNextInspect's closure and the failsafe
--- timer inside NextInspect both capture the same upvalue rather than trying
--- to look up a global named "NextInspect" (which would be nil).
+-- Forward declaration so that scheduleNextInspect's closure can capture the
+-- NextInspect upvalue before the function body is assigned.  Without this,
+-- Lua would resolve the bare name 'NextInspect' as a global (_G.NextInspect),
+-- which is always nil, causing a runtime crash when the timer fires.
 local NextInspect
 
 -- Schedule the next inspection step after a short delay.
@@ -731,14 +732,20 @@ NextInspect = function()
     RaidInspect:Print(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(UnitGUID(unit))))
     NotifyInspect(unit)
 
-    -- Failsafe timeout so we never get stuck
+    -- Failsafe timeout so we never get stuck.
+    -- 30 seconds is intentionally much longer than the previous 5-second value:
+    -- Warmane and other WotLK private servers can take significantly longer to
+    -- deliver INSPECT_READY due to server-side inspect throttles.
     if inspTimer then RaidInspect:CancelTimer(inspTimer) end
     inspTimer = RaidInspect:ScheduleTimer(function()
         RaidInspect:Print(string.format("[RI] Inspect TIMEOUT for '%s' – moving on", tostring(inspecting)))
         ClearInspectPlayer()
         inspecting = nil
-        NextInspect()
-    end, 5)
+        -- Use scheduleNextInspect rather than a direct call so that we honour
+        -- a small post-timeout gap before the next request, reducing the chance
+        -- of immediately hitting the same server throttle again.
+        scheduleNextInspect(2.0)
+    end, 30)
 end
 
 local function Enqueue(unit)
