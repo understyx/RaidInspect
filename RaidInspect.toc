@@ -1,7 +1,7 @@
 ## Interface: 30300
 ## Title: RaidInspect
 ## Notes: Automatically inspects raid/party members and displays a table with GearScore, talents, gems and enchants.
-## SavedVariables: RaidInspectDB GS_Settings GS_Data
+## SavedVariables: RaidInspectDB
 ## Version: 1.0.0
 
 Libraries\Load_Libraries.xml
@@ -9,8 +9,6 @@ Libraries\Ace3\AceComm-3.0\AceComm-3.0.xml
 Libraries\Ace3\AceTimer-3.0\AceTimer-3.0.xml
 Libraries\LibGroupTalents-1.0\lib.xml
 
-GearScoreLite\informationLite.lua
-GearScoreLite\GearScoreLite.lua
-
+Skin.lua
 MiniTalentWidget.lua
 RaidInspect.lua

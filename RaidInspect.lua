@@ -135,12 +135,199 @@ local TALHOV_GLYPH_SEP = 5     -- top gap before the "Glyphs:" label (px)
 local TALHOV_GLYPH_LH  = 14    -- line height for each glyph entry (px)
 local TALHOV_DIM       = 0.25  -- vertex-colour brightness for unallocated talents
 
-local BACKDROP_DEF = {
-    bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile     = true, tileSize = 32, edgeSize = 32,
-    insets   = {left=11, right=12, top=12, bottom=11},
+-- ============================================================
+-- Inlined GearScore tables (previously from GearScoreLite)
+-- ============================================================
+
+local GS_ItemTypes = {
+    ["INVTYPE_RELIC"]           = { SlotMOD = 0.3164, ItemSlot = 18, Enchantable = false },
+    ["INVTYPE_TRINKET"]         = { SlotMOD = 0.5625, ItemSlot = 33, Enchantable = false },
+    ["INVTYPE_2HWEAPON"]        = { SlotMOD = 2.000,  ItemSlot = 16, Enchantable = true  },
+    ["INVTYPE_WEAPONMAINHAND"]  = { SlotMOD = 1.0000, ItemSlot = 16, Enchantable = true  },
+    ["INVTYPE_WEAPONOFFHAND"]   = { SlotMOD = 1.0000, ItemSlot = 17, Enchantable = true  },
+    ["INVTYPE_RANGED"]          = { SlotMOD = 0.3164, ItemSlot = 18, Enchantable = true  },
+    ["INVTYPE_THROWN"]          = { SlotMOD = 0.3164, ItemSlot = 18, Enchantable = false },
+    ["INVTYPE_RANGEDRIGHT"]     = { SlotMOD = 0.3164, ItemSlot = 18, Enchantable = false },
+    ["INVTYPE_SHIELD"]          = { SlotMOD = 1.0000, ItemSlot = 17, Enchantable = true  },
+    ["INVTYPE_WEAPON"]          = { SlotMOD = 1.0000, ItemSlot = 36, Enchantable = true  },
+    ["INVTYPE_HOLDABLE"]        = { SlotMOD = 1.0000, ItemSlot = 17, Enchantable = false },
+    ["INVTYPE_HEAD"]            = { SlotMOD = 1.0000, ItemSlot = 1,  Enchantable = true  },
+    ["INVTYPE_NECK"]            = { SlotMOD = 0.5625, ItemSlot = 2,  Enchantable = false },
+    ["INVTYPE_SHOULDER"]        = { SlotMOD = 0.7500, ItemSlot = 3,  Enchantable = true  },
+    ["INVTYPE_CHEST"]           = { SlotMOD = 1.0000, ItemSlot = 5,  Enchantable = true  },
+    ["INVTYPE_ROBE"]            = { SlotMOD = 1.0000, ItemSlot = 5,  Enchantable = true  },
+    ["INVTYPE_WAIST"]           = { SlotMOD = 0.7500, ItemSlot = 6,  Enchantable = false },
+    ["INVTYPE_LEGS"]            = { SlotMOD = 1.0000, ItemSlot = 7,  Enchantable = true  },
+    ["INVTYPE_FEET"]            = { SlotMOD = 0.7500, ItemSlot = 8,  Enchantable = true  },
+    ["INVTYPE_WRIST"]           = { SlotMOD = 0.5625, ItemSlot = 9,  Enchantable = true  },
+    ["INVTYPE_HAND"]            = { SlotMOD = 0.7500, ItemSlot = 10, Enchantable = true  },
+    ["INVTYPE_FINGER"]          = { SlotMOD = 0.5625, ItemSlot = 31, Enchantable = false },
+    ["INVTYPE_CLOAK"]           = { SlotMOD = 0.5625, ItemSlot = 15, Enchantable = true  },
+    ["INVTYPE_BODY"]            = { SlotMOD = 0,      ItemSlot = 4,  Enchantable = false },
 }
+
+local GS_Formula = {
+    ["A"] = {
+        [4] = { A = 91.4500, B = 0.6500 },
+        [3] = { A = 81.3750, B = 0.8125 },
+        [2] = { A = 73.0000, B = 1.0000 },
+    },
+    ["B"] = {
+        [4] = { A = 26.0000, B = 1.2000 },
+        [3] = { A = 0.7500,  B = 1.8000 },
+        [2] = { A = 8.0000,  B = 2.0000 },
+        [1] = { A = 0.0000,  B = 2.2500 },
+    },
+}
+
+local GS_Quality = {
+    [6000] = {
+        Red   = { A = 0.94, B = 5000, C = 0.00006, D =  1 },
+        Green = { A = 0.47, B = 5000, C = 0.00047, D = -1 },
+        Blue  = { A = 0,    B = 0,    C = 0,        D =  0 },
+        Description = "Legendary",
+    },
+    [5000] = {
+        Red   = { A = 0.69, B = 4000, C = 0.00025, D =  1 },
+        Green = { A = 0.28, B = 4000, C = 0.00019, D =  1 },
+        Blue  = { A = 0.97, B = 4000, C = 0.00096, D = -1 },
+        Description = "Epic",
+    },
+    [4000] = {
+        Red   = { A = 0.0, B = 3000, C = 0.00069, D =  1 },
+        Green = { A = 0.5, B = 3000, C = 0.00022, D = -1 },
+        Blue  = { A = 1,   B = 3000, C = 0.00003, D = -1 },
+        Description = "Superior",
+    },
+    [3000] = {
+        Red   = { A = 0.12, B = 2000, C = 0.00012, D = -1 },
+        Green = { A = 1,    B = 2000, C = 0.00050, D = -1 },
+        Blue  = { A = 0,    B = 2000, C = 0.001,   D =  1 },
+        Description = "Uncommon",
+    },
+    [2000] = {
+        Red   = { A = 1, B = 1000, C = 0.00088, D = -1 },
+        Green = { A = 1, B = 0,    C = 0,        D =  0 },
+        Blue  = { A = 1, B = 1000, C = 0.001,   D = -1 },
+        Description = "Common",
+    },
+    [1000] = {
+        Red   = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+        Green = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+        Blue  = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+        Description = "Trash",
+    },
+}
+
+-- ============================================================
+-- Inlined GearScore functions (previously from GearScoreLite)
+-- ============================================================
+
+-- Returns (Red, Blue, Green) colour triple for a given score value.
+-- NOTE: the second and third return values use the GS_Quality "Green" and
+-- "Blue" keys respectively — this matches the original GearScoreLite
+-- naming quirk that PopulateRow already accounts for.
+local function GearScore_GetQuality(ItemScore)
+    if not ItemScore then return 0.1, 0.1, 0.1 end
+    if ItemScore > 5999 then ItemScore = 5999 end
+    for i = 0, 6 do
+        if ItemScore > i * 1000 and ItemScore <= (i + 1) * 1000 then
+            local q = GS_Quality[(i + 1) * 1000]
+            local r = q.Red["A"]   + ((ItemScore - q.Red["B"])   * q.Red["C"])   * q.Red["D"]
+            local b = q.Green["A"] + ((ItemScore - q.Green["B"]) * q.Green["C"]) * q.Green["D"]
+            local g = q.Blue["A"]  + ((ItemScore - q.Blue["B"])  * q.Blue["C"])  * q.Blue["D"]
+            return r, b, g
+        end
+    end
+    return 0.1, 0.1, 0.1
+end
+
+-- Returns the enchant-penalty multiplier for an item (1 = no penalty).
+local function GearScore_GetEnchantInfo(ItemLink, ItemEquipLoc)
+    if not ItemLink or not ItemEquipLoc then return 1 end
+    local typeInfo = GS_ItemTypes[ItemEquipLoc]
+    if not typeInfo or not typeInfo.Enchantable then return 1 end
+    local parts = {}
+    local s = ItemLink:match("|H(item:[^|]+)|h")
+    if not s then return 1 end
+    for p in s:gmatch("[^:]+") do parts[#parts + 1] = p end
+    local enchantID = tonumber(parts[3] or "0") or 0
+    if enchantID == 0 then
+        local percent = floor((-2 * typeInfo.SlotMOD) * 100) / 100
+        return 1 + (percent / 100)
+    end
+    return 1
+end
+
+-- Returns (score, itemLevel) for a single item link.
+local function GearScore_GetItemScore(ItemLink)
+    if not ItemLink then return 0, 0 end
+    local _, _, ItemRarity, ItemLevel, _, _, _, _, ItemEquipLoc =
+        GetItemInfo(ItemLink)
+    if not ItemLevel then return 0, 0 end
+    local QualityScale = 1
+    local Scale = 1.8618
+    if     ItemRarity == 5 then QualityScale = 1.3;   ItemRarity = 4
+    elseif ItemRarity == 1 then QualityScale = 0.005; ItemRarity = 2
+    elseif ItemRarity == 0 then QualityScale = 0.005; ItemRarity = 2 end
+    if ItemRarity == 7 then ItemRarity = 3; ItemLevel = 187.05 end
+    local typeInfo = GS_ItemTypes[ItemEquipLoc]
+    if not typeInfo then return -1, ItemLevel end
+    local Table = (ItemLevel > 120) and GS_Formula["A"] or GS_Formula["B"]
+    if not (ItemRarity >= 2 and ItemRarity <= 4) then return -1, ItemLevel end
+    local GearScore = floor(
+        ((ItemLevel - Table[ItemRarity].A) / Table[ItemRarity].B)
+        * typeInfo.SlotMOD * Scale * QualityScale)
+    if ItemLevel == 187.05 then ItemLevel = 0 end
+    if GearScore < 0 then GearScore = 0 end
+    local percent = GearScore_GetEnchantInfo(ItemLink, ItemEquipLoc) or 1
+    GearScore = floor(GearScore * percent)
+    return GearScore, ItemLevel
+end
+
+-- Returns (totalScore, averageItemLevel) for a unit's equipped gear.
+local function GearScore_GetScore(_, Target)
+    if not UnitIsPlayer(Target) then return 0, 0 end
+    local _, PlayerEnglishClass = UnitClass(Target)
+    local GearScore = 0; local ItemCount = 0; local LevelTotal = 0; local TitanGrip = 1
+
+    -- Detect Titan's Grip: two-handed weapon in main-hand while off-hand is also equipped
+    if GetInventoryItemLink(Target, 16) and GetInventoryItemLink(Target, 17) then
+        local _, _, _, _, _, _, _, _, ItemEquipLoc = GetItemInfo(GetInventoryItemLink(Target, 16))
+        if ItemEquipLoc == "INVTYPE_2HWEAPON" then TitanGrip = 0.5 end
+    end
+
+    -- Off-hand slot (17) scored separately to apply Titan's Grip multiplier
+    local offLink = GetInventoryItemLink(Target, 17)
+    if offLink then
+        local _, _, _, _, _, _, _, _, ItemEquipLoc = GetItemInfo(offLink)
+        if ItemEquipLoc == "INVTYPE_2HWEAPON" then TitanGrip = 0.5 end
+        local TempScore, ItemLevel = GearScore_GetItemScore(offLink)
+        if PlayerEnglishClass == "HUNTER" then TempScore = TempScore * 0.3164 end
+        GearScore = GearScore + TempScore * TitanGrip
+        ItemCount = ItemCount + 1
+        LevelTotal = LevelTotal + ItemLevel
+    end
+
+    -- All remaining slots
+    for i = 1, 18 do
+        if i ~= 4 and i ~= 17 then
+            local ItemLink = GetInventoryItemLink(Target, i)
+            if ItemLink then
+                local TempScore, ItemLevel = GearScore_GetItemScore(ItemLink)
+                if i == 16 and PlayerEnglishClass == "HUNTER" then TempScore = TempScore * 0.3164 end
+                if i == 18 and PlayerEnglishClass == "HUNTER" then TempScore = TempScore * 5.3224 end
+                if i == 16 then TempScore = TempScore * TitanGrip end
+                GearScore = GearScore + TempScore
+                ItemCount = ItemCount + 1
+                LevelTotal = LevelTotal + ItemLevel
+            end
+        end
+    end
+
+    if ItemCount == 0 then return 0, 0 end
+    return floor(GearScore), floor(LevelTotal / ItemCount)
+end
 
 -- ============================================================
 -- Saved-variable defaults
@@ -241,10 +428,9 @@ local function IsFullyGemmed(link)
 end
 
 -- Returns true when the item has an enchant or does not need one.
--- Uses GS_ItemTypes (populated by GearScoreLite/informationLite.lua).
 local function IsEnchanted(link, equipLoc)
     if not link or not equipLoc then return true end
-    local info = GS_ItemTypes and GS_ItemTypes[equipLoc]
+    local info = GS_ItemTypes[equipLoc]
     if not info or not info.Enchantable then return true end
     local parts = ParseLink(link)
     if not parts then return true end
@@ -379,11 +565,8 @@ local function CollectData(unit)
         items[slot] = GetInventoryItemLink(unit, slot)
     end
 
-    -- GearScore (from GearScoreLite)
-    local gs = 0
-    if GearScore_GetScore then
-        gs = GearScore_GetScore(name, unit) or 0
-    end
+    -- GearScore
+    local gs = GearScore_GetScore(name, unit) or 0
 
     -- Gem and enchant status (scan all gear slots)
     local missingGems, missingEnchants = false, false
@@ -471,7 +654,10 @@ local function NextInspect()
     end
 
     if not UnitExists(unit) or not CanInspect(unit) then
-        NextInspect(); return
+        -- Schedule asynchronously to avoid deep recursion when many players
+        -- are out of range or offline; a 0-second timer fires on the next frame.
+        RaidInspect:ScheduleTimer(NextInspect, 0)
+        return
     end
 
     inspecting = unit
@@ -619,7 +805,7 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
             local existing = cache[incoming.name]
             if existing then
                 -- Preserve any locally-inspected fields that the remote client
-                -- did not include (e.g. gearscore from GearScoreLite may differ).
+                -- did not include (e.g. gearscore may differ across clients).
                 for k, v in pairs(incoming) do
                     existing[k] = v
                 end
@@ -677,8 +863,7 @@ local function CreatePaperdollFrame()
     local fH = PDOLL_LPAD + 14 + maxRows * PDOLL_ROW + PDOLL_LPAD
 
     local f = CreateFrame("Frame", "RaidInspect_PaperdollHover", UIParent)
-    f:SetBackdrop(BACKDROP_DEF)
-    f:SetBackdropColor(0, 0, 0, 0.92)
+    ns.SetFlat(f)
     f:SetSize(fW, fH)
     f:SetFrameStrata("HIGH")
     f:SetToplevel(true)
@@ -784,8 +969,7 @@ local function ShowPaperdollHover(anchor, data)
                         local parts = {}
 
                         local enchantText = GetEnchantText(link)
-                        local needsEnchant = GS_ItemTypes
-                            and GS_ItemTypes[equipLoc or ""]
+                        local needsEnchant = GS_ItemTypes[equipLoc or ""]
                             and GS_ItemTypes[equipLoc or ""].Enchantable
                         if enchantText then
                             parts[#parts + 1] = "|cff00dd00" .. enchantText .. "|r"
@@ -868,8 +1052,7 @@ local function CreateTalentHoverFrame()
     local fH = 400
 
     local f = CreateFrame("Frame", "RaidInspect_TalentHover", UIParent)
-    f:SetBackdrop(BACKDROP_DEF)
-    f:SetBackdropColor(0, 0, 0, 0.92)
+    ns.SetFlat(f)
     f:SetSize(fW, fH)
     f:SetFrameStrata("HIGH")
     f:SetToplevel(true)
@@ -1219,16 +1402,13 @@ local function PopulateRow(row, data)
     row.guildText:SetText(data.guild or "")
     row.guildText:SetTextColor(0.9, 0.9, 0.9, 1)
 
-    -- GearScore with colour from GearScoreLite
+    -- GearScore with colour coding
     if data.gearscore then
         -- GearScore_GetQuality's internal variables are mislabelled: it returns
-    -- (Red_value, Blue_value, Green_value) even though the locals inside the
-    -- function are named Red/Green/Blue.  Capture them with the correct names
-    -- so the final SetTextColor call is unambiguous.
-        local gsRed, gsBlue, gsGreen = 1, 1, 1
-        if GearScore_GetQuality then
-            gsRed, gsBlue, gsGreen = GearScore_GetQuality(data.gearscore)
-        end
+        -- (Red_value, Blue_value, Green_value) even though the locals inside the
+        -- function are named Red/Green/Blue.  Capture them with the correct names
+        -- so the final SetTextColor call is unambiguous.
+        local gsRed, gsBlue, gsGreen = GearScore_GetQuality(data.gearscore)
         row.gsText:SetText(tostring(data.gearscore))
         row.gsText:SetTextColor(gsRed, gsGreen, gsBlue, 1)
     else
@@ -1284,8 +1464,7 @@ function RaidInspect:OpenTalentFilterEditor(class)
     -- One-time creation of the popup window
     if not talentEditorWindow then
         local win = CreateFrame("Frame", "RaidInspect_TalentEditor", UIParent)
-        win:SetBackdrop(BACKDROP_DEF)
-        win:SetBackdropColor(0, 0, 0, 0.9)
+        ns.SetFlat(win)
         win:SetSize(510, 500)
         win:SetPoint("CENTER")
         win:SetMovable(true)
@@ -1299,11 +1478,13 @@ function RaidInspect:OpenTalentFilterEditor(class)
 
         local titleText = win:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         titleText:SetPoint("TOP", win, "TOP", 0, -10)
+        titleText:SetTextColor(unpack(ns.C.gold))
         win.titleText = titleText
 
         local closeBtn = CreateFrame("Button", nil, win, "UIPanelCloseButton")
         closeBtn:SetPoint("TOPRIGHT", win, "TOPRIGHT", -2, -2)
         closeBtn:SetScript("OnClick", function() win:Hide() end)
+        ns.SkinCloseButton(closeBtn)
 
         local hint = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         hint:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", 14, 10)
@@ -1409,8 +1590,7 @@ function RaidInspect:CreateMainFrame()
     if mainFrame then return end
 
     local f = CreateFrame("Frame", "RaidInspect_Main", UIParent)
-    f:SetBackdrop(BACKDROP_DEF)
-    f:SetBackdropColor(0, 0, 0, 0.9)
+    ns.SetFlat(f)
     f:SetSize(WINDOW_W, WINDOW_H)
     f:SetPoint("CENTER", UIParent, "CENTER",
         self.db.profile.windowX, self.db.profile.windowY)
@@ -1433,11 +1613,13 @@ function RaidInspect:CreateMainFrame()
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     title:SetPoint("TOP", f, "TOP", 0, -10)
     title:SetText("RaidInspect")
+    title:SetTextColor(unpack(ns.C.gold))
 
     -- Close button
     local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     closeBtn:SetScript("OnClick", function() f:Hide() end)
+    ns.SkinCloseButton(closeBtn)
 
     -- Scan button
     local scanBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
@@ -1445,6 +1627,7 @@ function RaidInspect:CreateMainFrame()
     scanBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -7)
     scanBtn:SetText("Scan Raid")
     scanBtn:SetScript("OnClick", function() RaidInspect:ScanRaid() end)
+    ns.SkinFlatButton(scanBtn)
 
     -- Config button
     local cfgBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
@@ -1454,6 +1637,7 @@ function RaidInspect:CreateMainFrame()
     cfgBtn:SetScript("OnClick", function()
         LibStub("AceConfigDialog-3.0"):Open(addonName)
     end)
+    ns.SkinFlatButton(cfgBtn)
 
     -- Glyph-request button
     local glyphBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
@@ -1461,6 +1645,7 @@ function RaidInspect:CreateMainFrame()
     glyphBtn:SetPoint("LEFT", cfgBtn, "RIGHT", 4, 0)
     glyphBtn:SetText("Request Glyphs")
     glyphBtn:SetScript("OnClick", function() RaidInspect:RequestGlyphs() end)
+    ns.SkinFlatButton(glyphBtn)
 
     -- Request Data button — asks out-of-range addon users to share their
     -- gear, talent, and glyph data via AceComm.
@@ -1469,6 +1654,7 @@ function RaidInspect:CreateMainFrame()
     dataBtn:SetPoint("LEFT", glyphBtn, "RIGHT", 4, 0)
     dataBtn:SetText("Request Data")
     dataBtn:SetScript("OnClick", function() RaidInspect:RequestData() end)
+    ns.SkinFlatButton(dataBtn)
 
     -- Column header row
     local headerRow = CreateHeaderRow(f)

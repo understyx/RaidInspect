@@ -858,6 +858,18 @@ skinners["BlizOptionsGroup"] = function(widget)
 end
 
 -- ==========================================================
+-- EXPOSE HELPERS TO ADDON NAMESPACE
+-- ==========================================================
+-- RaidInspect.lua (loaded after Skin.lua in the TOC) uses these
+-- to skin its own hand-crafted frames.
+
+ns.SetFlat         = SetFlat
+ns.SkinFlatButton  = SkinFlatButton
+ns.SkinCloseButton = SkinCloseButton
+ns.flatBackdrop    = flatBackdrop
+ns.C               = C
+
+-- ==========================================================
 -- SCOPE SKINNING TO AURATRACKER WIDGETS ONLY
 -- ==========================================================
 -- AceGUI is a shared library – hooking Create globally would
