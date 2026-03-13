@@ -9,6 +9,8 @@ local addonName, ns = ...
 --
 -- Rows are tinted with the player's class colour.  Per-class acceptable specs
 -- are configured via AceConfig toggles and shown as checkmarks in the table.
+-- Per-talent required/excluded filters can additionally be set through the
+-- talent-filter editor (opened via "Edit Talent Filters" per class in Config).
 --
 -- AceComm (COMM_PREFIX "RI1") is used to request glyph data from other users
 -- of the addon in the same group.
@@ -20,6 +22,8 @@ local RaidInspect = LibStub("AceAddon-3.0"):NewAddon(addonName,
     "AceComm-3.0",
     "AceTimer-3.0"
 )
+
+local LGT = LibStub("LibGroupTalents-1.0", true)
 
 -- ============================================================
 -- Constants
@@ -120,6 +124,7 @@ local BACKDROP_DEF = {
 local defaults = {
     profile = {
         acceptableSpecs = {},   -- [class] = {[1]=bool,[2]=bool,[3]=bool}
+        talentFilters   = {},   -- [class] = {[talentName]=true/false}
         gsThreshold     = 5000,
         windowX         = 0,
         windowY         = 0,
@@ -246,6 +251,23 @@ local function IsSpecAcceptable(class, talentData)
     return cfg[primary] == true
 end
 
+-- Returns true/false/nil (all-pass/any-fail/not-configured) for whether
+-- the inspected player's per-talent point counts satisfy the saved filters.
+-- Filters: true = talent must have at least 1 rank; false = must have 0 ranks.
+local function IsTalentFilterSatisfied(class, talentPoints)
+    if not class or not talentPoints then return nil end
+    local db = RaidInspect.db and RaidInspect.db.profile
+    if not db then return nil end
+    local classFilter = db.talentFilters and db.talentFilters[class]
+    if not classFilter or not next(classFilter) then return nil end
+    for talentName, required in pairs(classFilter) do
+        local rank = talentPoints[talentName] or 0
+        if required == true  and rank == 0 then return false end
+        if required == false and rank >  0 then return false end
+    end
+    return true
+end
+
 -- ============================================================
 -- Data collection (called immediately after INSPECT_READY)
 -- ============================================================
@@ -287,14 +309,21 @@ local function CollectData(unit)
         end
     end
 
-    -- Talent point distribution across the three trees
-    local talentData = {0, 0, 0}
-    local numTabs = (GetNumTalentTabs and GetNumTalentTabs()) or 3
+    -- Talent point distribution across the three trees.
+    -- Pass isnotplayer so we read the inspected unit's talents rather than
+    -- the player's own; for "player" both values are equivalent.
+    local isnotplayer = not UnitIsUnit(unit, "player")
+    local talentData  = {0, 0, 0}
+    local talentPoints = {}          -- [talentName] = currentRank (> 0 only)
+    local numTabs = (GetNumTalentTabs and GetNumTalentTabs(isnotplayer)) or 3
     for tab = 1, math.min(numTabs, 3) do
-        local numTalents = (GetNumTalents and GetNumTalents(tab)) or 0
+        local numTalents = (GetNumTalents and GetNumTalents(tab, isnotplayer)) or 0
         for idx = 1, numTalents do
-            local _, _, _, _, rank = GetTalentInfo(tab, idx)
+            local talName, _, _, _, rank = GetTalentInfo(tab, idx, isnotplayer)
             talentData[tab] = (talentData[tab] or 0) + (rank or 0)
+            if talName and rank and rank > 0 then
+                talentPoints[talName] = rank
+            end
         end
     end
 
@@ -319,7 +348,8 @@ local function CollectData(unit)
         items     = items,
         gemmed    = not missingGems,
         enchanted = not missingEnchants,
-        talentData= talentData,
+        talentData   = talentData,
+        talentPoints = talentPoints,
         glyphs    = glyphs,
         timestamp = GetTime(),
     }
@@ -708,8 +738,19 @@ local function PopulateRow(row, data)
     row.talBtn:SetScript("OnEnter", function(btn) ShowTalentTooltip(btn, data) end)
     row.talBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- Spec acceptable
-    SetStatusIcon(row.specTex, IsSpecAcceptable(data.class, data.talentData))
+    -- Spec acceptable — combine the coarse spec-tree check with the
+    -- per-talent filter check; if only one is configured, use that one.
+    local specOk   = IsSpecAcceptable(data.class, data.talentData)
+    local filterOk = IsTalentFilterSatisfied(data.class, data.talentPoints)
+    local acceptable
+    if specOk ~= nil and filterOk ~= nil then
+        acceptable = specOk and filterOk
+    elseif specOk ~= nil then
+        acceptable = specOk
+    else
+        acceptable = filterOk  -- may still be nil when neither is configured
+    end
+    SetStatusIcon(row.specTex, acceptable)
 
     -- Gemmed
     SetStatusIcon(row.gemTex, data.gemmed)
@@ -718,6 +759,111 @@ local function PopulateRow(row, data)
     SetStatusIcon(row.enchTex, data.enchanted)
 
     row:Show()
+end
+
+-- ============================================================
+-- Talent filter editor
+-- ============================================================
+
+-- Reusable popup window that hosts the MiniTalentWidget.
+-- One instance is kept alive for the session; switching classes reuses it.
+local talentEditorWindow = nil
+local talentEditorWidget = nil
+
+function RaidInspect:OpenTalentFilterEditor(class)
+    -- One-time creation of the popup window
+    if not talentEditorWindow then
+        local win = CreateFrame("Frame", "RaidInspect_TalentEditor", UIParent)
+        win:SetBackdrop(BACKDROP_DEF)
+        win:SetBackdropColor(0, 0, 0, 0.9)
+        win:SetSize(510, 500)
+        win:SetPoint("CENTER")
+        win:SetMovable(true)
+        win:SetClampedToScreen(true)
+        win:EnableMouse(true)
+        win:RegisterForDrag("LeftButton")
+        win:SetScript("OnDragStart", function(w) w:StartMoving() end)
+        win:SetScript("OnDragStop",  function(w) w:StopMovingOrSizing() end)
+        win:SetToplevel(true)
+        win:SetFrameStrata("DIALOG")
+
+        local titleText = win:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        titleText:SetPoint("TOP", win, "TOP", 0, -10)
+        win.titleText = titleText
+
+        local closeBtn = CreateFrame("Button", nil, win, "UIPanelCloseButton")
+        closeBtn:SetPoint("TOPRIGHT", win, "TOPRIGHT", -2, -2)
+        closeBtn:SetScript("OnClick", function() win:Hide() end)
+
+        local hint = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        hint:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", 14, 10)
+        hint:SetText("Click: Yellow = required  |  Red = excluded  |  Dim = any")
+        hint:SetTextColor(0.7, 0.7, 0.7, 1)
+
+        -- Message shown when no talent data is loaded for the selected class
+        local noDataMsg = win:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        noDataMsg:SetPoint("CENTER", win, "CENTER", 0, 0)
+        noDataMsg:SetJustifyH("CENTER")
+        noDataMsg:SetTextColor(0.6, 0.6, 0.6, 1)
+        noDataMsg:Hide()
+        win.noDataMsg = noDataMsg
+
+        -- Create the talent widget and reparent it into our window
+        local AceGUI = LibStub("AceGUI-3.0")
+        local w = AceGUI:Create("AuraTrackerMiniTalent")
+        w:SetCallback("OnValueChanged", function(widget, idx, state, talentName)
+            local cls = widget.class
+            if not cls or not talentName then return end
+            if not RaidInspect.db.profile.talentFilters[cls] then
+                RaidInspect.db.profile.talentFilters[cls] = {}
+            end
+            local tbl = RaidInspect.db.profile.talentFilters[cls]
+            if state ~= nil then
+                tbl[talentName] = state
+            else
+                tbl[talentName] = nil
+                if not next(tbl) then
+                    RaidInspect.db.profile.talentFilters[cls] = nil
+                end
+            end
+            RaidInspect:RefreshTable()
+        end)
+
+        -- Embed the talent frame inside our window
+        w.frame:SetParent(win)
+        w.frame:ClearAllPoints()
+        -- Leave room above for the title (≈30 px) plus the toggle/dropdown row
+        -- that sits 24 px above the talent frame itself.
+        w.frame:SetPoint("TOPLEFT", win, "TOPLEFT", 36, -64)
+
+        talentEditorWindow = win
+        talentEditorWidget = w
+    end
+
+    -- Update window title and switch to the requested class
+    local displayName = CLASS_LOCAL_NAMES[class] or class
+    talentEditorWindow.titleText:SetText("Talent Filters — " .. displayName)
+
+    talentEditorWidget:SetClass(class)
+
+    -- Show or hide the "no data" message
+    local hasData = LGT and LGT.classTalentData and LGT.classTalentData[class]
+    if hasData then
+        talentEditorWindow.noDataMsg:Hide()
+    else
+        talentEditorWindow.noDataMsg:SetFormattedText(
+            "No talent data loaded for %s.\n"
+            .. "Inspect a %s player in-game\nto populate this tree.",
+            displayName, displayName)
+        talentEditorWindow.noDataMsg:Show()
+    end
+
+    -- Restore previously saved filter states for this class
+    local filters = self.db.profile.talentFilters[class] or {}
+    talentEditorWidget:RestoreValues(filters)
+
+    talentEditorWindow:Show()
+    talentEditorWindow:Raise()
 end
 
 -- ============================================================
@@ -884,10 +1030,11 @@ function RaidInspect:GetOptions()
     -- Build per-class spec-toggle groups
     local specArgs = {}
     for i, class in ipairs(CLASS_ORDER) do
+        local ci        = class          -- capture for all closures in this iteration
         local specNames = CLASS_SPEC_NAMES[class] or {}
         local classArgs = {}
         for si, sname in ipairs(specNames) do
-            local ci, sii = class, si  -- capture locals for closures
+            local sii = si               -- capture inner loop variable
             classArgs["spec"..si] = {
                 order = si,
                 type  = "toggle",
@@ -910,6 +1057,18 @@ function RaidInspect:GetOptions()
                 end,
             }
         end
+        -- Button to open the per-talent filter editor for this class
+        classArgs["editTalentFilters"] = {
+            order = 99,
+            type  = "execute",
+            name  = "Edit Talent Filters",
+            desc  = "Open the per-talent filter editor for "
+                    .. (CLASS_LOCAL_NAMES[ci] or ci) .. "s.\n"
+                    .. "Yellow = required talent  |  Red = excluded talent",
+            func  = function()
+                RaidInspect:OpenTalentFilterEditor(ci)
+            end,
+        }
         specArgs[class] = {
             order  = i,
             type   = "group",
