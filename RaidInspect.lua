@@ -355,6 +355,8 @@ local inspDelayTimer     = nil    -- handle for the 0.5-second inter-inspect del
 local inspectingGUID     = nil    -- GUID of the inspected unit captured at NotifyInspect time;
                                   -- used to validate INSPECT_TALENT_READY which carries no GUID arg
 local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
+local inspRetries        = {}     -- [playerName] = retry count for incomplete-gear re-inspects
+local MAX_INSPECT_RETRIES = 2     -- re-inspect at most this many times when gear data is empty
 
 -- Set to true to enable verbose [RI] diagnostic messages in the chat frame.
 -- These are intentionally off by default; they are only needed when debugging
@@ -779,6 +781,7 @@ end
 function RaidInspect:ScanRaid()
     wipe(inspQueue)
     wipe(cache)
+    wipe(inspRetries)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
     if inspDelayTimer then self:CancelTimer(inspDelayTimer); inspDelayTimer = nil end
     inspecting         = nil
@@ -850,7 +853,12 @@ end
 local function FinishInspect(source)
     if inspTimer then RaidInspect:CancelTimer(inspTimer); inspTimer = nil end
 
-    local data = CollectData(inspecting)
+    -- Save both the unit token and its GUID now; both will be nilled before we
+    -- finish, and the GUID is needed to validate the retry callback.
+    local unit      = inspecting
+    local savedGUID = inspectingGUID
+
+    local data = CollectData(unit)
     if data then
         local oldData = cache[data.name]
 
@@ -879,8 +887,34 @@ local function FinishInspect(source)
 
         cache[data.name] = data
         RaidInspect:RefreshTable()
+
+        -- On private servers the first inspect event sometimes arrives before
+        -- item data is ready, causing all GetInventoryItemLink() calls to return
+        -- nil.  Detect this by checking whether the items table is completely
+        -- empty and, if so, schedule a re-inspect after a short delay so that
+        -- the server has time to send item data.  We cap retries to avoid an
+        -- infinite loop for players who are genuinely wearing nothing.
+        local hasItems = next(data.items) ~= nil
+        if not hasItems then
+            local retries = inspRetries[data.name] or 0
+            if retries < MAX_INSPECT_RETRIES then
+                inspRetries[data.name] = retries + 1
+                dprint(string.format("[RI] %s – '%s' returned no item data (retry %d/%d), re-queuing", source, data.name, retries + 1, MAX_INSPECT_RETRIES))
+                -- Wait 3 seconds before re-inspecting to allow item cache to populate.
+                -- Validate the unit token still refers to the same player before
+                -- re-enqueueing (raid roster may change within the 3-second window).
+                RaidInspect:ScheduleTimer(function()
+                    if UnitGUID(unit) == savedGUID then
+                        Enqueue(unit)
+                        if not inspecting and not inspDelayTimer then NextInspect() end
+                    end
+                end, 3)
+            end
+        else
+            inspRetries[data.name] = nil  -- successful gear data: reset counter
+        end
     else
-        dprint(string.format("[RI] %s – CollectData returned nil for '%s'", source, tostring(inspecting)))
+        dprint(string.format("[RI] %s – CollectData returned nil for '%s'", source, tostring(unit)))
     end
 
     ClearInspectPlayer()
