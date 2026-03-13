@@ -1,7 +1,7 @@
 ## Interface: 30300
 ## Title: RaidInspect
 ## Notes: Automatically inspects raid/party members and displays a table with GearScore, talents, gems and enchants.
-## SavedVariables: RaidInspectDB
+## SavedVariables: RaidInspectDB GS_Settings GS_Data
 ## Version: 1.0.0
 
 Libraries\Load_Libraries.xml
