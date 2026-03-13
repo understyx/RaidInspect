@@ -696,7 +696,6 @@ local function Enqueue(unit)
         if u == unit then return end
     end
     inspQueue[#inspQueue+1] = unit
-    if not inspecting then NextInspect() end
 end
 
 function RaidInspect:ScanRaid()
@@ -729,6 +728,7 @@ function RaidInspect:ScanRaid()
 
     local total = #inspQueue + (inspecting and 1 or 0)
     self:Print(string.format("Queueing %d member(s) for inspection…", total))
+    if not inspecting then NextInspect() end
 end
 
 -- AutoScan enqueues current group members WITHOUT wiping the cache.
@@ -753,6 +753,7 @@ function RaidInspect:AutoScan()
             end
         end
     end
+    if not inspecting then NextInspect() end
 end
 
 -- ============================================================
@@ -761,7 +762,7 @@ end
 
 function RaidInspect:INSPECT_READY(_, guid)
     if not inspecting then return end
-    if guid ~= UnitGUID(inspecting) then return end
+    if guid and guid ~= UnitGUID(inspecting) then return end
 
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
 
