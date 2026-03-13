@@ -719,7 +719,7 @@ NextInspect = function()
             dprint("[RI] CollectData returned nil for local player")
         end
         -- Use the same inter-inspect delay as for other units.
-        scheduleNextInspect(0.1)
+        scheduleNextInspect(0.5)
         return
     end
 
@@ -931,7 +931,7 @@ local function FinishInspect(source)
     inspectingGUID = nil
 
     -- Small delay between inspects to respect server throttling
-    scheduleNextInspect(0.1)
+    scheduleNextInspect(0.5)
 end
 
 function RaidInspect:INSPECT_READY(_, guid)
