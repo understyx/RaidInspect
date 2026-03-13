@@ -356,8 +356,9 @@ local inspectingGUID     = nil    -- GUID of the inspected unit captured at Noti
                                   -- used to validate INSPECT_TALENT_READY which carries no GUID arg
 local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
 local inspRetries        = {}     -- [playerName] = retry count for incomplete-gear re-inspects
-local MAX_INSPECT_RETRIES = 2     -- re-inspect at most this many times when gear data is missing or incomplete
-local INSPECT_RETRY_DELAY = 1    -- seconds to wait before a retry inspect (gives server time to push data)
+local MAX_INSPECT_RETRIES = 9     -- re-inspect at most this many times when gear data is missing or incomplete
+                                  -- (1 initial attempt + 9 retries = 10 total scan attempts per player)
+local INSPECT_RETRY_DELAY = 3     -- seconds to wait before a retry inspect (gives server time to push data)
 
 -- Set to true to enable verbose [RI] diagnostic messages in the chat frame.
 -- These are intentionally off by default; they are only needed when debugging
@@ -718,8 +719,8 @@ NextInspect = function()
         else
             dprint("[RI] CollectData returned nil for local player")
         end
-        -- Use the same inter-inspect delay as for other units.
-        scheduleNextInspect(0.5)
+        -- Minimum 3 second gap between player inspects.
+        scheduleNextInspect(3)
         return
     end
 
@@ -930,8 +931,8 @@ local function FinishInspect(source)
     inspecting    = nil
     inspectingGUID = nil
 
-    -- Small delay between inspects to respect server throttling
-    scheduleNextInspect(0.5)
+    -- Minimum 3 second gap between player inspects to respect server throttling.
+    scheduleNextInspect(3)
 end
 
 function RaidInspect:INSPECT_READY(_, guid)
@@ -2081,6 +2082,9 @@ function RaidInspect:OnEnable()
     self:RegisterEvent("RAID_ROSTER_UPDATE")
     self:RegisterEvent("PARTY_MEMBERS_CHANGED")
     self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri data · /ri config")
+    -- If we are already in a group when the addon loads, kick off scanning
+    -- immediately without waiting for a roster-change event or manual /ri scan.
+    self:AutoScan()
 end
 
 function RaidInspect:OnDisable()
