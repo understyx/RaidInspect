@@ -1,9 +1,0 @@
-## Interface: 30300
-## Title: Swingbar
-## Notes: Melee and ranged swing timer bars
-## SavedVariables: SwingbarDB
-## Version: 1.0.0
-
-Libraries\Load_Libraries.xml
-Skin.lua
-Swingbar.lua
