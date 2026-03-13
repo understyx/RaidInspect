@@ -89,6 +89,8 @@ local SOCKET_TEXTS = {
 local COMM_PREFIX    = "RI1"        -- kept ≤ 16 chars for ChatThrottle
 local GLYPH_REQ_MSG  = "GR"
 local GLYPH_RESP_MSG = "GD"
+local DATA_REQ_MSG   = "DR"         -- request full gear/talent/glyph data
+local DATA_RESP_MSG  = "DD"         -- response with full player data
 
 -- UI sizing
 local WINDOW_W      = 560
@@ -232,9 +234,10 @@ local function GetSocketCounts(link)
 end
 
 -- Returns true when the item is fully gemmed (or has no sockets).
+-- An item is fully gemmed when it has zero empty sockets remaining.
 local function IsFullyGemmed(link)
-    local filled, total = GetSocketCounts(link)
-    return total == 0 or filled >= total
+    local _, emptyCount = GetSocketCounts(link)
+    return emptyCount == 0
 end
 
 -- Returns true when the item has an enchant or does not need one.
@@ -249,25 +252,46 @@ local function IsEnchanted(link, equipLoc)
 end
 
 -- Returns the display name of the permanent enchant on an item link, or nil.
--- In WotLK the enchant field in item links is the spell ID of the enchant cast,
--- so GetSpellInfo gives the spell name.  The "Enchant Slot - Name" prefix is
--- stripped so only the short enchant name is returned.
+-- The enchant field in WotLK item links is a SpellItemEnchantment.dbc entry ID,
+-- which is NOT the same as a spell ID — GetSpellInfo() cannot be used here.
+-- Instead, we scan the hidden tooltip: enchant descriptions appear as bright-green
+-- lines that do NOT carry the "Equip:" or "Use:" prefix used by the item's own
+-- built-in bonus effects.
 local function GetEnchantText(link)
     local parts = ParseLink(link)
     if not parts then return nil end
     local enchantID = tonumber(parts[3] or "0") or 0
     if enchantID == 0 then return nil end
-    local name = GetSpellInfo(enchantID)
-    if name then
-        name = name:gsub("^Enchant%s+%S+%s*%-%s*", "")  -- "Enchant Weapon - Berserking" → "Berserking"
-        name = name:gsub("^Enchant%s*%-%s*", "")         -- "Enchant - ..."              → "..."
-        if name == "" then name = nil end
+
+    local ok = pcall(function() scanTip:SetHyperlink(link) end)
+    if not ok then return "Enchanted" end
+
+    local result = nil
+    for i = 2, scanTip:NumLines() do   -- skip line 1 = item name
+        local lineL = _G["RaidInspect_ScanTipTextLeft"..i]
+        if lineL then
+            local txt = lineL:GetText() or ""
+            local r, g, b = lineL:GetTextColor()
+            -- Enchant lines are bright lime-green (R < 0.25, G > 0.75, B < 0.15)
+            -- and do NOT start with "Equip:" or "Use:" (item-own bonus lines).
+            if r and g and b
+            and r < 0.25 and g > 0.75 and b < 0.15
+            and not txt:match("^Equip:")
+            and not txt:match("^Use:")
+            and txt ~= "" then
+                result = txt
+                break
+            end
+        end
     end
-    return name or (enchantID > 0 and "Enchanted" or nil)
+    scanTip:ClearLines()
+    return result or "Enchanted"
 end
 
 -- Returns ({gemName, …}, filledCount, totalSocketCount) for an item link.
 -- Gem names come from GetItemInfo on each gem item ID embedded in the link.
+-- totalSocketCount = filled gems + empty sockets, so it is non-zero whenever
+-- the item has sockets at all (regardless of how many are filled).
 local function GetGemInfo(link)
     local parts = ParseLink(link)
     if not parts then return {}, 0, 0 end
@@ -279,8 +303,9 @@ local function GetGemInfo(link)
             names[#names + 1] = gn or "Gem"
         end
     end
-    local filled, total = GetSocketCounts(link)
-    return names, filled, total
+    local _, emptyCount = GetSocketCounts(link)
+    local totalSockets = #names + emptyCount   -- filled gems + empty sockets
+    return names, #names, totalSockets
 end
 
 -- ============================================================
@@ -546,20 +571,62 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
         end
         local payload = AceSerializer:Serialize(GLYPH_RESP_MSG, myGlyphs)
         self:SendCommMessage(COMM_PREFIX, payload, "WHISPER", sender)
+
+    elseif message == DATA_REQ_MSG then
+        -- Respond with our own complete gear / talent / glyph data so that the
+        -- requester can inspect us even when we are out of their inspect range.
+        local myData = CollectData("player")
+        if myData then
+            local payload = AceSerializer:Serialize(DATA_RESP_MSG, {
+                name         = myData.name,
+                class        = myData.class,
+                guild        = myData.guild,
+                gearscore    = myData.gearscore,
+                items        = myData.items,
+                gemmed       = myData.gemmed,
+                enchanted    = myData.enchanted,
+                talentData   = myData.talentData,
+                talentPoints = myData.talentPoints,
+                glyphs       = myData.glyphs,
+            })
+            self:SendCommMessage(COMM_PREFIX, payload, "WHISPER", sender)
+        end
+
     else
-        -- Try to deserialise as a glyph response
-        local ok, msgType, glyphs = AceSerializer:Deserialize(message)
-        if ok and msgType == GLYPH_RESP_MSG then
+        -- Try to deserialise as a glyph response or a full data response
+        local ok, msgType, payload = AceSerializer:Deserialize(message)
+        if not ok then return end
+
+        if msgType == GLYPH_RESP_MSG then
             -- Match sender to a cache entry (strip realm suffix for comparison)
             local senderBase = sender:match("^([^%-]+)") or sender
             for name, data in pairs(cache) do
                 local nameBase = name:match("^([^%-]+)") or name
                 if nameBase:lower() == senderBase:lower() then
-                    data.glyphs = glyphs
+                    data.glyphs = payload
                     self:RefreshTable()
                     break
                 end
             end
+
+        elseif msgType == DATA_RESP_MSG then
+            -- Full player data response — merge into cache.
+            -- The sender reports their OWN data, so it is authoritative.
+            local incoming = payload
+            if not incoming or not incoming.name then return end
+            incoming.timestamp = GetTime()
+
+            local existing = cache[incoming.name]
+            if existing then
+                -- Preserve any locally-inspected fields that the remote client
+                -- did not include (e.g. gearscore from GearScoreLite may differ).
+                for k, v in pairs(incoming) do
+                    existing[k] = v
+                end
+            else
+                cache[incoming.name] = incoming
+            end
+            self:RefreshTable()
         end
     end
 end
@@ -569,6 +636,16 @@ function RaidInspect:RequestGlyphs()
     local channel = numRaid > 0 and "RAID" or "PARTY"
     self:SendCommMessage(COMM_PREFIX, GLYPH_REQ_MSG, channel)
     self:Print("Requested glyph data from raid/party members running RaidInspect.")
+end
+
+-- Broadcasts a full-data request to all group members running RaidInspect.
+-- Each responding client sends back their own gear, talents, and glyphs so
+-- that players who are out of inspect range can still be shown in the table.
+function RaidInspect:RequestData()
+    local numRaid = GetNumRaidMembers()
+    local channel = numRaid > 0 and "RAID" or "PARTY"
+    self:SendCommMessage(COMM_PREFIX, DATA_REQ_MSG, channel)
+    self:Print("Requested gear/talent data from raid/party members running RaidInspect.")
 end
 
 -- ============================================================
@@ -1385,6 +1462,14 @@ function RaidInspect:CreateMainFrame()
     glyphBtn:SetText("Request Glyphs")
     glyphBtn:SetScript("OnClick", function() RaidInspect:RequestGlyphs() end)
 
+    -- Request Data button — asks out-of-range addon users to share their
+    -- gear, talent, and glyph data via AceComm.
+    local dataBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    dataBtn:SetSize(100, 22)
+    dataBtn:SetPoint("LEFT", glyphBtn, "RIGHT", 4, 0)
+    dataBtn:SetText("Request Data")
+    dataBtn:SetScript("OnClick", function() RaidInspect:RequestData() end)
+
     -- Column header row
     local headerRow = CreateHeaderRow(f)
     headerRow:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -34)
@@ -1561,7 +1646,7 @@ end
 
 function RaidInspect:OnEnable()
     self:RegisterEvent("INSPECT_READY")
-    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri config")
+    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri data · /ri config")
 end
 
 function RaidInspect:OnDisable()
@@ -1579,6 +1664,8 @@ function RaidInspect:SlashCommand(input)
         LibStub("AceConfigDialog-3.0"):Open(addonName)
     elseif cmd == "glyphs" then
         self:RequestGlyphs()
+    elseif cmd == "data" then
+        self:RequestData()
     else
         self:ToggleWindow()
     end
