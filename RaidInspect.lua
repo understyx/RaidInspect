@@ -110,6 +110,29 @@ local ICON_CHECK    = "Interface\\RaidFrame\\ReadyCheck-Ready"
 local ICON_CROSS    = "Interface\\RaidFrame\\ReadyCheck-NotReady"
 local ICON_WAIT     = "Interface\\RaidFrame\\ReadyCheck-Waiting"
 
+-- Paperdoll hover frame layout
+-- Left column:  Head, Neck, Shoulder, Back, Chest, Wrist, Trinket 1, Trinket 2
+-- Right column: Hands, Waist, Legs, Feet, Ring 1, Ring 2, Main Hand, Off Hand, Ranged
+local PDOLL_LEFT    = {1, 2, 3, 15, 5, 9, 13, 14}
+local PDOLL_RIGHT   = {10, 6, 7, 8, 11, 12, 16, 17, 18}
+local PDOLL_ICON    = 28     -- item icon pixel size
+local PDOLL_ROW     = 32     -- row height (px)
+local PDOLL_COLW    = 160    -- total column width (icon + text)
+local PDOLL_LPAD    = 12     -- left/right inner padding
+
+-- Talent hover frame layout (read-only inspection tree)
+local TALHOV_BTN       = 22    -- talent icon pixel size
+local TALHOV_SPC       = 27    -- icon spacing, center-to-center (px)
+local TALHOV_COLS      = 4     -- max columns per talent tree
+local TALHOV_TABS      = 3     -- talent trees
+local TALHOV_LPAD      = 12    -- left/right inner padding
+local TALHOV_TABSEP    = 4     -- gap between adjacent talent trees (px)
+local TALHOV_TITLE_H   = 13    -- height of the title text row (px)
+local TALHOV_HEADER_H  = 15    -- height of the per-tree spec-name row (px)
+local TALHOV_GLYPH_SEP = 5     -- top gap before the "Glyphs:" label (px)
+local TALHOV_GLYPH_LH  = 14    -- line height for each glyph entry (px)
+local TALHOV_DIM       = 0.25  -- vertex-colour brightness for unallocated talents
+
 local BACKDROP_DEF = {
     bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
     edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -149,6 +172,14 @@ scanTip:SetOwner(WorldFrame, "ANCHOR_NONE")
 local rows = {}
 -- Frame references
 local mainFrame, scrollChild
+
+-- Hover frame state (created lazily the first time they are shown)
+local paperdollFrame     = nil   -- RaidInspect_PaperdollHover
+local paperdollSlots     = {}    -- [slotID] -> slot row Button
+local paperdollHideTimer = nil   -- AceTimer handle for delayed hide
+local talentHoverFrame     = nil   -- RaidInspect_TalentHover
+local talentHoverButtons   = {}    -- flat list of talent icon Buttons (3×30)
+local talentHoverHideTimer = nil   -- AceTimer handle for delayed hide
 
 -- ============================================================
 -- Gem / enchant helpers
@@ -215,6 +246,41 @@ local function IsEnchanted(link, equipLoc)
     local parts = ParseLink(link)
     if not parts then return true end
     return (tonumber(parts[3] or "0") or 0) > 0
+end
+
+-- Returns the display name of the permanent enchant on an item link, or nil.
+-- In WotLK the enchant field in item links is the spell ID of the enchant cast,
+-- so GetSpellInfo gives the spell name.  The "Enchant Slot - Name" prefix is
+-- stripped so only the short enchant name is returned.
+local function GetEnchantText(link)
+    local parts = ParseLink(link)
+    if not parts then return nil end
+    local enchantID = tonumber(parts[3] or "0") or 0
+    if enchantID == 0 then return nil end
+    local name = GetSpellInfo(enchantID)
+    if name then
+        name = name:gsub("^Enchant%s+%S+%s*%-%s*", "")  -- "Enchant Weapon - Berserking" → "Berserking"
+        name = name:gsub("^Enchant%s*%-%s*", "")         -- "Enchant - ..."              → "..."
+        if name == "" then name = nil end
+    end
+    return name or (enchantID > 0 and "Enchanted" or nil)
+end
+
+-- Returns ({gemName, …}, filledCount, totalSocketCount) for an item link.
+-- Gem names come from GetItemInfo on each gem item ID embedded in the link.
+local function GetGemInfo(link)
+    local parts = ParseLink(link)
+    if not parts then return {}, 0, 0 end
+    local names = {}
+    for i = 4, 7 do
+        local gemID = tonumber(parts[i] or "0") or 0
+        if gemID > 0 then
+            local gn = GetItemInfo(gemID)
+            names[#names + 1] = gn or "Gem"
+        end
+    end
+    local filled, total = GetSocketCounts(link)
+    return names, filled, total
 end
 
 -- ============================================================
@@ -328,9 +394,11 @@ local function CollectData(unit)
     end
 
     -- Glyph data (major + minor, sockets 1-6)
+    -- GetGlyphSocketInfo returns: enabled, glyphType, glyphSpellID, icon
+    -- glyphType == 1 → Major glyph; glyphType == 2 → Minor glyph
     local glyphs = {}
     for socket = 1, 6 do
-        local glyphType, _, glyphSpellID, icon = GetGlyphSocketInfo(socket)
+        local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
         if glyphSpellID and glyphSpellID > 0 then
             glyphs[socket] = {
                 spellID   = glyphSpellID,
@@ -467,7 +535,7 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
         -- Respond with our own glyph data
         local myGlyphs = {}
         for socket = 1, 6 do
-            local glyphType, _, glyphSpellID, icon = GetGlyphSocketInfo(socket)
+            local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
             if glyphSpellID and glyphSpellID > 0 then
                 myGlyphs[socket] = {
                     spellID   = glyphSpellID,
@@ -504,80 +572,445 @@ function RaidInspect:RequestGlyphs()
 end
 
 -- ============================================================
--- Tooltip helpers
+-- Paperdoll hover frame
 -- ============================================================
 
-local function ShowTalentTooltip(anchor, data)
-    if not data then return end
-    GameTooltip:SetOwner(anchor, "ANCHOR_RIGHT")
-    GameTooltip:ClearLines()
+-- Schedules (or re-schedules) a delayed hide of the paperdoll frame.
+local function HidePaperdollHover()
+    if paperdollHideTimer then return end
+    paperdollHideTimer = RaidInspect:ScheduleTimer(function()
+        paperdollHideTimer = nil
+        if paperdollFrame then paperdollFrame:Hide() end
+    end, 0.15)
+end
 
-    local specNames = CLASS_SPEC_NAMES[data.class] or {"Tree 1", "Tree 2", "Tree 3"}
-    local td        = data.talentData or {0, 0, 0}
+local function CancelPaperdollHide()
+    if paperdollHideTimer then
+        RaidInspect:CancelTimer(paperdollHideTimer)
+        paperdollHideTimer = nil
+    end
+end
 
-    GameTooltip:AddLine(data.name .. "'s Talents", 1, 1, 1)
-    GameTooltip:AddLine(" ")
-    for i = 1, 3 do
-        GameTooltip:AddDoubleLine(
-            specNames[i] or ("Tree "..i),
-            (td[i] or 0).." pts",
-            0.8, 0.8, 0.8,
-            1.0, 1.0, 0.0
-        )
+-- Creates the shared paperdoll hover frame on first use.
+local function CreatePaperdollFrame()
+    if paperdollFrame then return end
+
+    local maxRows = math.max(#PDOLL_LEFT, #PDOLL_RIGHT)
+    local fW = PDOLL_LPAD + PDOLL_COLW + 4 + PDOLL_COLW + PDOLL_LPAD
+    local fH = PDOLL_LPAD + 14 + maxRows * PDOLL_ROW + PDOLL_LPAD
+
+    local f = CreateFrame("Frame", "RaidInspect_PaperdollHover", UIParent)
+    f:SetBackdrop(BACKDROP_DEF)
+    f:SetBackdropColor(0, 0, 0, 0.92)
+    f:SetSize(fW, fH)
+    f:SetFrameStrata("HIGH")
+    f:SetToplevel(true)
+    f:EnableMouse(true)
+
+    local titleFS = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    titleFS:SetPoint("TOP", f, "TOP", 0, -7)
+    f.titleFS = titleFS
+
+    -- Helper that creates one row for a single gear slot
+    local function MakeSlotRow(slotID, col, rowIdx)
+        local xOff = PDOLL_LPAD + (col - 1) * (PDOLL_COLW + 4)
+        local yOff = -(PDOLL_LPAD + 13 + (rowIdx - 1) * PDOLL_ROW)
+
+        local rf = CreateFrame("Button", nil, f)
+        rf:SetSize(PDOLL_COLW, PDOLL_ROW)
+        rf:SetPoint("TOPLEFT", f, "TOPLEFT", xOff, yOff)
+        rf:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+
+        local iconTex = rf:CreateTexture(nil, "ARTWORK")
+        iconTex:SetSize(PDOLL_ICON, PDOLL_ICON)
+        iconTex:SetPoint("LEFT", rf, "LEFT", 0, 0)
+        rf.iconTex = iconTex
+
+        local nameFS = rf:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        nameFS:SetPoint("TOPLEFT", iconTex, "TOPRIGHT", 4, -1)
+        nameFS:SetWidth(PDOLL_COLW - PDOLL_ICON - 6)
+        nameFS:SetJustifyH("LEFT")
+        nameFS:SetWordWrap(false)
+        rf.nameFS = nameFS
+
+        local statusFS = rf:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        statusFS:SetPoint("BOTTOMLEFT", iconTex, "BOTTOMRIGHT", 4, 1)
+        statusFS:SetWidth(PDOLL_COLW - PDOLL_ICON - 6)
+        statusFS:SetJustifyH("LEFT")
+        statusFS:SetWordWrap(false)
+        rf.statusFS = statusFS
+
+        -- Slot buttons cancel the hide timer while hovered so that moving the
+        -- mouse over individual slots (or their item tooltips) keeps the frame up.
+        rf:SetScript("OnEnter", function(btn)
+            CancelPaperdollHide()
+            -- Show the item's own tooltip when hovering the icon area
+            if btn.itemLink then
+                GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
+                GameTooltip:SetHyperlink(btn.itemLink)
+                GameTooltip:Show()
+            end
+        end)
+        rf:SetScript("OnLeave", function()
+            GameTooltip:Hide()
+            HidePaperdollHover()
+        end)
+
+        rf.slotID = slotID
+        paperdollSlots[slotID] = rf
     end
 
-    -- Glyph data if available
+    for i, slotID in ipairs(PDOLL_LEFT)  do MakeSlotRow(slotID, 1, i) end
+    for i, slotID in ipairs(PDOLL_RIGHT) do MakeSlotRow(slotID, 2, i) end
+
+    -- Cancel hide when the cursor re-enters the frame itself (gap between slots)
+    f:SetScript("OnEnter", CancelPaperdollHide)
+    f:SetScript("OnLeave", HidePaperdollHover)
+
+    f:Hide()
+    paperdollFrame = f
+end
+
+-- Populates and shows the paperdoll hover frame anchored near `anchor`.
+local function ShowPaperdollHover(anchor, data)
+    if not data then return end
+    if not paperdollFrame then CreatePaperdollFrame() end
+    CancelPaperdollHide()
+
+    paperdollFrame.titleFS:SetText(data.name .. "'s Equipment")
+
+    for _, slotList in ipairs({PDOLL_LEFT, PDOLL_RIGHT}) do
+        for _, slotID in ipairs(slotList) do
+            local rf = paperdollSlots[slotID]
+            if rf then
+                local link = data.items and data.items[slotID]
+                rf.itemLink = link
+                if link then
+                    local itemName, _, quality, itemLevel, _, _, _, _, equipLoc, icon =
+                        GetItemInfo(link)
+                    if itemName then
+                        rf.iconTex:SetTexture(icon or "Interface\\Buttons\\UI-EmptySlot-Disabled")
+                        rf.iconTex:SetVertexColor(1, 1, 1, 1)
+
+                        -- Quality-coloured item name + ilvl
+                        local r, g, b = 0.8, 0.8, 0.8
+                        if ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[quality] then
+                            r = ITEM_QUALITY_COLORS[quality].r
+                            g = ITEM_QUALITY_COLORS[quality].g
+                            b = ITEM_QUALITY_COLORS[quality].b
+                        end
+                        local ilvlStr = itemLevel and " ("..itemLevel..")" or ""
+                        rf.nameFS:SetText(itemName .. ilvlStr)
+                        rf.nameFS:SetTextColor(r, g, b, 1)
+
+                        -- Status line: enchant then gems
+                        local parts = {}
+
+                        local enchantText = GetEnchantText(link)
+                        local needsEnchant = GS_ItemTypes
+                            and GS_ItemTypes[equipLoc or ""]
+                            and GS_ItemTypes[equipLoc or ""].Enchantable
+                        if enchantText then
+                            parts[#parts + 1] = "|cff00dd00" .. enchantText .. "|r"
+                        elseif needsEnchant then
+                            parts[#parts + 1] = "|cffff4444No enchant|r"
+                        end
+
+                        local gemNames, _, total = GetGemInfo(link)
+                        if total > 0 then
+                            for _, gn in ipairs(gemNames) do
+                                parts[#parts + 1] = "|cff66ccff" .. gn .. "|r"
+                            end
+                            for _ = #gemNames + 1, total do
+                                parts[#parts + 1] = "|cffff4444Empty|r"
+                            end
+                        end
+
+                        rf.statusFS:SetText(table.concat(parts, "  "))
+                    else
+                        -- Item data not yet in client cache
+                        rf.iconTex:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+                        rf.iconTex:SetVertexColor(1, 1, 1, 1)
+                        rf.nameFS:SetText(SLOT_NAMES[slotID] or ("Slot "..slotID))
+                        rf.nameFS:SetTextColor(0.5, 0.5, 0.5, 1)
+                        rf.statusFS:SetText("")
+                    end
+                else
+                    -- Empty slot
+                    rf.iconTex:SetTexture("Interface\\Buttons\\UI-EmptySlot-Disabled")
+                    rf.iconTex:SetVertexColor(1, 1, 1, 0.4)
+                    rf.nameFS:SetText(SLOT_NAMES[slotID] or ("Slot "..slotID))
+                    rf.nameFS:SetTextColor(0.4, 0.4, 0.4, 1)
+                    rf.statusFS:SetText("")
+                end
+            end
+        end
+    end
+
+    paperdollFrame:ClearAllPoints()
+    paperdollFrame:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    paperdollFrame:Show()
+    paperdollFrame:Raise()
+end
+
+-- ============================================================
+-- Talent hover frame (read-only inspect tree)
+-- ============================================================
+
+-- Schedules (or re-schedules) a delayed hide of the talent hover frame.
+local function HideTalentHover()
+    if talentHoverHideTimer then return end
+    talentHoverHideTimer = RaidInspect:ScheduleTimer(function()
+        talentHoverHideTimer = nil
+        if talentHoverFrame then talentHoverFrame:Hide() end
+    end, 0.15)
+end
+
+local function CancelTalentHide()
+    if talentHoverHideTimer then
+        RaidInspect:CancelTimer(talentHoverHideTimer)
+        talentHoverHideTimer = nil
+    end
+end
+
+-- Returns the x offset (from frame TOPLEFT) for a talent button at
+-- tree-tab `tab` (1-3) and column `col` (1-4).
+local function TalHovX(tab, col)
+    return TALHOV_LPAD
+        + (tab - 1) * (TALHOV_COLS * TALHOV_SPC + TALHOV_TABSEP)
+        + (col - 1) * TALHOV_SPC
+end
+
+-- Creates the shared talent hover frame on first use.
+local function CreateTalentHoverFrame()
+    if talentHoverFrame then return end
+
+    -- Pre-compute fixed frame width from the rightmost button position
+    local fW = TalHovX(TALHOV_TABS, TALHOV_COLS) + TALHOV_BTN + TALHOV_LPAD
+    -- Height is set dynamically in ShowTalentHover; start with a reasonable default
+    local fH = 400
+
+    local f = CreateFrame("Frame", "RaidInspect_TalentHover", UIParent)
+    f:SetBackdrop(BACKDROP_DEF)
+    f:SetBackdropColor(0, 0, 0, 0.92)
+    f:SetSize(fW, fH)
+    f:SetFrameStrata("HIGH")
+    f:SetToplevel(true)
+    f:EnableMouse(true)
+
+    -- Title and per-tree spec-name headers
+    local titleFS = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    titleFS:SetPoint("TOP", f, "TOP", 0, -7)
+    f.titleFS = titleFS
+
+    local treeHeaders = {}
+    for t = 1, TALHOV_TABS do
+        local hfs = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        hfs:SetPoint("TOPLEFT", f, "TOPLEFT",
+            TalHovX(t, 1), -(TALHOV_LPAD + TALHOV_TITLE_H))
+        hfs:SetWidth(TALHOV_COLS * TALHOV_SPC)
+        hfs:SetJustifyH("CENTER")
+        treeHeaders[t] = hfs
+    end
+    f.treeHeaders = treeHeaders
+
+    -- Pre-create 3 × MAX_NUM_TALENTS talent icon buttons
+    local maxTalents = MAX_NUM_TALENTS or 30
+    for i = 1, maxTalents * TALHOV_TABS do
+        local tab = math.ceil(i / maxTalents)
+
+        local btn = CreateFrame("Button", nil, f)
+        btn:SetSize(TALHOV_BTN, TALHOV_BTN)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", -2000, 0)  -- hidden initially
+
+        local iconTex = btn:CreateTexture(nil, "ARTWORK")
+        iconTex:SetAllPoints()
+        btn.iconTex = iconTex
+
+        -- Small rank-count label in the bottom-right corner of the icon
+        local rankFS = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        rankFS:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", 1, 1)
+        rankFS:SetText("")
+        btn.rankFS = rankFS
+
+        btn:SetScript("OnEnter", function(self)
+            CancelTalentHide()
+            if self.talentName then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:ClearLines()
+                GameTooltip:AddLine(self.talentName, 1, 1, 1)
+                if self.rank and self.maxRank then
+                    GameTooltip:AddLine(
+                        (self.rank) .. " / " .. (self.maxRank) .. " pts",
+                        0.8, 0.8, 0.8)
+                end
+                GameTooltip:Show()
+            end
+        end)
+        btn:SetScript("OnLeave", function()
+            GameTooltip:Hide()
+            HideTalentHover()
+        end)
+
+        btn:Hide()
+        btn.tab = tab
+        talentHoverButtons[i] = btn
+    end
+
+    -- Glyph section elements (positioned dynamically in ShowTalentHover)
+    local glyphSep = f:CreateTexture(nil, "ARTWORK")
+    glyphSep:SetHeight(1)
+    glyphSep:SetTexture(0.3, 0.3, 0.3, 1)
+    f.glyphSep = glyphSep
+
+    local glyphTitleFS = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    glyphTitleFS:SetText("Glyphs:")
+    f.glyphTitleFS = glyphTitleFS
+
+    local glyphLines = {}
+    for i = 1, 6 do
+        local lfs = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lfs:SetJustifyH("LEFT")
+        lfs:SetWidth(fW - TALHOV_LPAD * 2)
+        lfs:Hide()
+        glyphLines[i] = lfs
+    end
+    f.glyphLines = glyphLines
+
+    f:SetScript("OnEnter", CancelTalentHide)
+    f:SetScript("OnLeave", HideTalentHover)
+
+    f:Hide()
+    talentHoverFrame = f
+end
+
+-- Populates and shows the talent hover frame anchored near `anchor`.
+local function ShowTalentHover(anchor, data)
+    if not data then return end
+    if not talentHoverFrame then CreateTalentHoverFrame() end
+    CancelTalentHide()
+
+    local f          = talentHoverFrame
+    local maxTalents = MAX_NUM_TALENTS or 30
+    local specNames  = CLASS_SPEC_NAMES[data.class] or {"Tree 1", "Tree 2", "Tree 3"}
+    local talPts     = data.talentData   or {0, 0, 0}
+    local talRanks   = data.talentPoints or {}
+
+    f.titleFS:SetText(data.name .. "'s Talents")
+
+    -- Update per-tree headers (spec name + point total)
+    for t = 1, TALHOV_TABS do
+        f.treeHeaders[t]:SetText(
+            (specNames[t] or ("Tree "..t)) .. "  " .. (talPts[t] or 0))
+    end
+
+    -- Reset all buttons
+    for _, btn in ipairs(talentHoverButtons) do
+        btn:Hide()
+        btn.talentName = nil
+        btn.rank       = nil
+        btn.maxRank    = nil
+    end
+
+    -- Populate buttons from LibGroupTalents class data
+    local classData = LGT and LGT.classTalentData and LGT.classTalentData[data.class]
+    local maxTier   = 0
+
+    if classData then
+        for treeIdx = 1, math.min(#classData, TALHOV_TABS) do
+            local tree = classData[treeIdx]
+            if tree and tree.list then
+                for _, entry in ipairs(tree.list) do
+                    local btnIdx = (treeIdx - 1) * maxTalents + entry.index
+                    local btn    = talentHoverButtons[btnIdx]
+                    if btn then
+                        local rank = talRanks[entry.name] or 0
+
+                        btn.iconTex:SetTexture(entry.icon)
+                        if rank > 0 then
+                            btn.iconTex:SetVertexColor(1, 1, 1, 1)
+                            btn.rankFS:SetText(tostring(rank))
+                            btn.rankFS:SetTextColor(1, 1, 0, 1)
+                        else
+                            btn.iconTex:SetVertexColor(TALHOV_DIM, TALHOV_DIM, TALHOV_DIM, 1)
+                            btn.rankFS:SetText("")
+                        end
+
+                        btn.talentName = entry.name
+                        btn.rank       = rank
+                        btn.maxRank    = entry.maxRank
+
+                        -- Pixel position inside the frame
+                        local xOff = TalHovX(treeIdx, entry.column)
+                        local yOff = -(TALHOV_LPAD + TALHOV_TITLE_H + TALHOV_HEADER_H
+                                       + TALHOV_SPC * (entry.tier - 1))
+                        btn:ClearAllPoints()
+                        btn:SetPoint("TOPLEFT", f, "TOPLEFT", xOff, yOff)
+                        btn:Show()
+
+                        if entry.tier > maxTier then maxTier = entry.tier end
+                    end
+                end
+            end
+        end
+    end
+
+    -- y-offset directly below the talent-tree area
+    local treeSectionH = TALHOV_LPAD + TALHOV_TITLE_H + TALHOV_HEADER_H
+                       + maxTier * TALHOV_SPC
+
+    -- Populate glyph section
+    local glyphCount = 0
     if data.glyphs and next(data.glyphs) then
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Glyphs:", 1, 0.82, 0)
         for socket = 1, 6 do
             local g = data.glyphs[socket]
             if g then
                 local spellName = GetSpellInfo(g.spellID)
                 if spellName then
-                    local typeStr = (g.glyphType == 1) and "[Major]" or "[Minor]"
-                    GameTooltip:AddLine("  "..typeStr.." "..spellName, 0.8, 0.8, 0.8)
+                    glyphCount = glyphCount + 1
+                    local lfs = f.glyphLines[glyphCount]
+                    if lfs then
+                        local typeStr = (g.glyphType == 1)
+                            and "|cffffcc00[Major]|r"
+                            or  "|cff99ccff[Minor]|r"
+                        lfs:SetText("  " .. typeStr .. " " .. spellName)
+                        lfs:SetPoint("TOPLEFT", f, "TOPLEFT",
+                            TALHOV_LPAD,
+                            -(treeSectionH + TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH
+                              + (glyphCount - 1) * TALHOV_GLYPH_LH))
+                        lfs:Show()
+                    end
                 end
             end
         end
+    end
+    for i = glyphCount + 1, 6 do
+        if f.glyphLines[i] then f.glyphLines[i]:Hide() end
+    end
+
+    if glyphCount > 0 then
+        f.glyphSep:SetPoint("TOPLEFT",  f, "TOPLEFT",  TALHOV_LPAD,  -treeSectionH)
+        f.glyphSep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -TALHOV_LPAD, -treeSectionH)
+        f.glyphTitleFS:SetPoint("TOPLEFT", f, "TOPLEFT",
+            TALHOV_LPAD, -(treeSectionH + TALHOV_GLYPH_SEP))
+        f.glyphSep:Show()
+        f.glyphTitleFS:Show()
     else
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("No glyph data — use 'Request Glyphs' button.", 0.5, 0.5, 0.5)
+        f.glyphSep:Hide()
+        f.glyphTitleFS:Hide()
     end
 
-    GameTooltip:Show()
-end
+    -- Resize frame to fit content
+    local glyphH = (glyphCount > 0)
+        and (TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH + glyphCount * TALHOV_GLYPH_LH + TALHOV_LPAD)
+        or  TALHOV_LPAD
+    f:SetHeight(treeSectionH + glyphH)
 
-local function ShowItemsTooltip(anchor, data)
-    if not data then return end
-    GameTooltip:SetOwner(anchor, "ANCHOR_RIGHT")
-    GameTooltip:ClearLines()
-    GameTooltip:AddLine(data.name .. "'s Equipment", 1, 1, 1)
-    GameTooltip:AddLine(" ")
-
-    for _, slot in ipairs(GEAR_SLOTS) do
-        local link = data.items and data.items[slot]
-        if link then
-            local itemName, _, quality, itemLevel = GetItemInfo(link)
-            if itemName then
-                local qColors = ITEM_QUALITY_COLORS
-                local r, g, b = 0.8, 0.8, 0.8
-                if qColors and qColors[quality] then
-                    r = qColors[quality].r
-                    g = qColors[quality].g
-                    b = qColors[quality].b
-                end
-                local slotLabel = SLOT_NAMES[slot] or ("Slot "..slot)
-                local ilvlStr   = itemLevel and (" (i"..itemLevel..")") or ""
-                GameTooltip:AddDoubleLine(
-                    slotLabel, itemName..ilvlStr,
-                    0.6, 0.6, 0.6,
-                    r, g, b
-                )
-            end
-        end
-    end
-    GameTooltip:Show()
+    -- Position the frame
+    f:ClearAllPoints()
+    f:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    f:Show()
+    f:Raise()
 end
 
 -- ============================================================
@@ -726,17 +1159,17 @@ local function PopulateRow(row, data)
         row.gsText:SetTextColor(0.5, 0.5, 0.5, 1)
     end
 
-    -- Items button
-    row.itemsBtn:SetScript("OnEnter", function(btn) ShowItemsTooltip(btn, data) end)
-    row.itemsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    -- Items button — opens the paperdoll hover frame
+    row.itemsBtn:SetScript("OnEnter", function(btn) ShowPaperdollHover(btn, data) end)
+    row.itemsBtn:SetScript("OnLeave", HidePaperdollHover)
 
     -- Talent distribution
     local td  = data.talentData or {0, 0, 0}
     local str = string.format("%d/%d/%d", td[1] or 0, td[2] or 0, td[3] or 0)
     row.talText:SetText(str)
     row.talText:SetTextColor(0.9, 0.9, 0.9, 1)
-    row.talBtn:SetScript("OnEnter", function(btn) ShowTalentTooltip(btn, data) end)
-    row.talBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    row.talBtn:SetScript("OnEnter", function(btn) ShowTalentHover(btn, data) end)
+    row.talBtn:SetScript("OnLeave", HideTalentHover)
 
     -- Spec acceptable — combine the coarse spec-tree check with the
     -- per-talent filter check; if only one is configured, use that one.
