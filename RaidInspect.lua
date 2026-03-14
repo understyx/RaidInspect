@@ -76,7 +76,8 @@ local DATA_RESP_MSG  = "DD"         -- response with full player data
 
 -- UI sizing
 local WINDOW_W      = 560
-local WINDOW_H      = 450
+local WINDOW_H      = 476     -- 450 content + 26 for the scale-slider row
+local SCALE_ROW_H   = 26      -- height of the item/talent scale slider row
 local ROW_H         = 18
 local HEADER_H      = 22
 local COL_NAME      = 120
@@ -316,8 +317,10 @@ end
 
 local defaults = {
     profile = {
-        windowX         = 0,
-        windowY         = 0,
+        windowX          = 0,
+        windowY          = 0,
+        itemFrameScale   = 1.0,
+        talentFrameScale = 1.0,
     },
 }
 
@@ -338,6 +341,8 @@ local MAX_INSPECT_RETRIES  = 9    -- re-inspect at most this many times when ite
                                   -- (1 initial attempt + 9 retries = 10 total scan attempts per player)
 local INSPECT_RETRY_DELAY  = 3    -- seconds to wait before a retry inspect (gives server time to push data)
 local INTER_INSPECT_DELAY  = 3    -- minimum seconds between consecutive player-to-player inspect transitions
+local INSPECT_TIMEOUT      = 10   -- seconds before giving up on a non-responding inspect
+local POST_TIMEOUT_DELAY   = 2.0  -- seconds to wait after a timeout before trying the next player
 
 -- Set to true to enable verbose [RI] diagnostic messages in the chat frame.
 -- These are intentionally off by default; they are only needed when debugging
@@ -721,8 +726,8 @@ NextInspect = function()
         return
     end
 
-    if not CanInspect(unit) then
-        dprint(string.format("[RI] CanInspect('%s') = false (out of range?) – skipping", tostring(unit)))
+    if not CheckInteractDistance(unit, 1) then
+        dprint(string.format("[RI] CheckInteractDistance('%s', 1) = false (out of range?) – skipping", tostring(unit)))
         -- Player is out of range or offline.  Flag a deferred comm request so
         -- that when the queue empties we ask group members running the addon to
         -- share their own data (covers the out-of-range case).
@@ -739,20 +744,23 @@ NextInspect = function()
     -- LGT delegates to LibTalentQuery which serialises all NotifyInspect calls
     -- across every addon using LGT, preventing duplicate inspect requests and
     -- the server-side rate-limiting that comes from multiple addons each calling
-    -- NotifyInspect independently.  When LGT is absent, fall back to our own
-    -- NotifyInspect call.
+    -- NotifyInspect independently.  When LGT is absent, fall back to InspectUnit.
     if LGT then
         dprint(string.format("[RI] Requesting inspect for '%s' via LGT (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
         LGT:GetUnitTalents(unit, true)
     else
-        dprint(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
-        NotifyInspect(unit)
+        -- Hide InspectFrame before calling InspectUnit to suppress the popup.
+        -- InspectUnit populates GetInventoryItemLink data and fires INSPECT_READY,
+        -- while keeping InspectFrame invisible to the user during the scan.
+        if InspectFrame then InspectFrame:Hide() end
+        dprint(string.format("[RI] Calling InspectUnit on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        InspectUnit(unit)
+        -- Immediately re-hide in case InspectUnit triggered a Show script.
+        if InspectFrame then InspectFrame:Hide() end
     end
 
     -- Failsafe timeout so we never get stuck if neither INSPECT_READY nor
     -- INSPECT_TALENT_READY fires (e.g. unit went offline mid-scan).
-    -- 10 seconds is generous enough for slow private servers while keeping
-    -- the overall scan time reasonable when many players are unreachable.
     if inspTimer then RaidInspect:CancelTimer(inspTimer) end
     inspTimer = RaidInspect:ScheduleTimer(function()
         dprint(string.format("[RI] Inspect TIMEOUT for '%s' – moving on", tostring(inspecting)))
@@ -762,8 +770,8 @@ NextInspect = function()
         -- Use scheduleNextInspect rather than a direct call so that we honour
         -- a small post-timeout gap before the next request, reducing the chance
         -- of immediately hitting the same server throttle again.
-        scheduleNextInspect(2.0)
-    end, 10)
+        scheduleNextInspect(POST_TIMEOUT_DELAY)
+    end, INSPECT_TIMEOUT)
 end
 
 local function Enqueue(unit)
@@ -916,6 +924,9 @@ local function FinishInspect(source)
     end
 
     ClearInspectPlayer()
+    -- Close the InspectFrame that was opened by InspectUnit (non-LGT path) so
+    -- the user does not see a leftover popup after each scan step.
+    if not LGT and InspectFrame then InspectFrame:Hide() end
     inspecting    = nil
     inspectingGUID = nil
 
@@ -1236,6 +1247,7 @@ local function ShowPaperdollHover(anchor, data)
 
     paperdollFrame:ClearAllPoints()
     paperdollFrame:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    paperdollFrame:SetScale(RaidInspect.db and RaidInspect.db.profile.itemFrameScale or 1.0)
     paperdollFrame:Show()
     paperdollFrame:Raise()
 end
@@ -1495,6 +1507,7 @@ local function ShowTalentHover(anchor, data)
     -- Position the frame
     f:ClearAllPoints()
     f:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    f:SetScale(RaidInspect.db and RaidInspect.db.profile.talentFrameScale or 1.0)
     f:Show()
     f:Raise()
 end
@@ -1736,21 +1749,63 @@ function RaidInspect:CreateMainFrame()
     dataBtn:SetScript("OnClick", function() RaidInspect:RequestData() end)
     ns.SkinFlatButton(dataBtn)
 
-    -- Column header row
+    -- Scale sliders — a second compact row below the main buttons.
+    -- Each slider adjusts the scale of the corresponding hover frame (0.5 – 2.0).
+    local function MakeScaleSlider(labelText, xAnchor, initKey)
+        local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lbl:SetText(labelText)
+        -- Align the label vertically centred within the scale-slider row.
+        -- 22 = button height of the first row (scanBtn/dataBtn), used as anchor reference.
+        local BTN_ROW_H = 22
+        lbl:SetPoint("TOPLEFT", xAnchor, "BOTTOMLEFT", 0, -(SCALE_ROW_H - BTN_ROW_H) / 2 - 4)
+
+        local sliderName = "RaidInspect_ScaleSlider_" .. initKey
+        local sl = CreateFrame("Slider", sliderName, f, "OptionsSliderTemplate")
+        sl:SetSize(110, 16)
+        sl:SetPoint("LEFT", lbl, "RIGHT", 6, 0)
+        sl:SetMinMaxValues(0.5, 2.0)
+        sl:SetValueStep(0.05)
+
+        local initVal = RaidInspect.db and RaidInspect.db.profile[initKey] or 1.0
+        sl:SetValue(initVal)
+
+        -- Replace the template's default "Low"/"High"/"Label" strings
+        local lo  = _G[sliderName .. "Low"]
+        local hi  = _G[sliderName .. "High"]
+        local txt = _G[sliderName .. "Text"]
+        if lo  then lo:SetText("0.5") end
+        if hi  then hi:SetText("2.0") end
+        if txt then txt:SetText(string.format("%.2f", initVal)) end
+
+        sl:SetScript("OnValueChanged", function(self, val)
+            -- Snap to the nearest 0.05 step (20 = 1/0.05, the number of steps per unit).
+            val = math.floor(val * 20 + 0.5) / 20
+            if txt then txt:SetText(string.format("%.2f", val)) end
+            if RaidInspect.db then
+                RaidInspect.db.profile[initKey] = val
+            end
+        end)
+        return sl
+    end
+
+    MakeScaleSlider("Item Scale:",   scanBtn, "itemFrameScale")
+    MakeScaleSlider("Talent Scale:", dataBtn, "talentFrameScale")
+
+    -- Column header row (pushed down to make room for the scale slider row)
     local headerRow = CreateHeaderRow(f)
-    headerRow:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -34)
+    headerRow:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -34 - SCALE_ROW_H)
 
     -- Separator line under headers
     local sep = f:CreateTexture(nil, "ARTWORK")
     sep:SetHeight(1)
     sep:SetTexture(0.3, 0.3, 0.3, 1)
-    sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  12, -34 - HEADER_H)
-    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -34 - HEADER_H)
+    sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  12, -34 - SCALE_ROW_H - HEADER_H)
+    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -34 - SCALE_ROW_H - HEADER_H)
 
     -- Scroll frame
     local sf = CreateFrame("ScrollFrame", "RaidInspect_ScrollFrame",
                            f, "UIPanelScrollFrameTemplate")
-    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  12, -34 - HEADER_H - 4)
+    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  12, -34 - SCALE_ROW_H - HEADER_H - 4)
     sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 10)
 
     local sc = CreateFrame("Frame", nil, sf)
