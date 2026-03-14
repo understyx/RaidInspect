@@ -356,9 +356,10 @@ local inspectingGUID     = nil    -- GUID of the inspected unit captured at Noti
                                   -- used to validate INSPECT_TALENT_READY which carries no GUID arg
 local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
 local inspRetries        = {}     -- [playerName] = retry count for incomplete-gear re-inspects
-local MAX_INSPECT_RETRIES = 9     -- re-inspect at most this many times when gear data is missing or incomplete
+local MAX_INSPECT_RETRIES  = 9    -- re-inspect at most this many times when gear data is missing or incomplete
                                   -- (1 initial attempt + 9 retries = 10 total scan attempts per player)
-local INSPECT_RETRY_DELAY = 3     -- seconds to wait before a retry inspect (gives server time to push data)
+local INSPECT_RETRY_DELAY  = 3    -- seconds to wait before a retry inspect (gives server time to push data)
+local INTER_INSPECT_DELAY  = 3    -- minimum seconds between consecutive player-to-player inspect transitions
 
 -- Set to true to enable verbose [RI] diagnostic messages in the chat frame.
 -- These are intentionally off by default; they are only needed when debugging
@@ -399,6 +400,28 @@ local function ParseLink(link)
     local t = {}
     for p in s:gmatch("[^:]+") do t[#t+1] = p end
     return t
+end
+
+-- Returns true when every item in the supplied items table has an all-zero
+-- enchant field AND all-zero gem fields in the item hyperlink.  This is the
+-- classic sign of a "bare" link: the server sent the item IDs but has not yet
+-- pushed the gem/enchant modification data to the client cache.  If ANY item
+-- has a non-zero enchant or gem the links are considered hydrated and this
+-- returns false.  Returns false also when the table is empty (no items at all
+-- is handled separately by the hasItems check).
+local function hasOnlyBareLinks(items)
+    local count = 0
+    for _, link in pairs(items) do
+        local parts = ParseLink(link)
+        if parts then
+            count = count + 1
+            if (tonumber(parts[3] or "0") or 0) ~= 0 then return false end
+            for i = 4, 7 do
+                if (tonumber(parts[i] or "0") or 0) ~= 0 then return false end
+            end
+        end
+    end
+    return count > 0
 end
 
 -- Returns (filledCount, totalSocketCount) for an item link.
@@ -719,8 +742,8 @@ NextInspect = function()
         else
             dprint("[RI] CollectData returned nil for local player")
         end
-        -- Minimum 3 second gap between player inspects.
-        scheduleNextInspect(3)
+        -- Minimum inter-inspect gap before the next player.
+        scheduleNextInspect(INTER_INSPECT_DELAY)
         return
     end
 
@@ -892,23 +915,38 @@ local function FinishInspect(source)
 
         -- On private servers the first inspect event sometimes arrives before
         -- item data or gear-score data is fully populated in the client cache.
-        -- Two known triggers for incomplete data:
+        -- Three known triggers for incomplete data:
         --   1. All GetInventoryItemLink() calls return nil (complete cache miss).
         --   2. Item links are returned, but they belong to transmog/appearance
         --      items (very low ilvl cosmetics) rather than the player's real gear,
         --      which causes GearScore to compute 0.
-        -- In both cases we schedule a re-inspect after a short delay so the
+        --   3. Item links are present and have valid ilvl, but all enchant and
+        --      gem fields in every link are zero — the server sent bare links
+        --      without the modification data (gems/enchants) yet.
+        --   4. Talent tree data returned all-zero totals — the talent packet
+        --      has not been fully applied to the client cache yet.
+        -- In all cases we schedule a re-inspect after a short delay so the
         -- server has time to push the correct data.  Retries are capped at
         -- MAX_INSPECT_RETRIES to avoid looping on genuinely empty/low-gs players.
-        local hasItems  = next(data.items) ~= nil
-        local needsRetry = not hasItems or (data.gearscore or 0) == 0
+        local hasItems     = next(data.items) ~= nil
+        local bareLinks    = hasItems and hasOnlyBareLinks(data.items)
+        local totalTalents = (data.talentData[1] or 0)
+                           + (data.talentData[2] or 0)
+                           + (data.talentData[3] or 0)
+        local needsRetry = not hasItems
+                        or (data.gearscore or 0) == 0
+                        or bareLinks
+                        or totalTalents == 0
         if needsRetry then
             local retries = inspRetries[data.name] or 0
             if retries < MAX_INSPECT_RETRIES then
                 inspRetries[data.name] = retries + 1
-                dprint(string.format("[RI] %s – '%s' returned incomplete data (gs=%.0f items=%s) – retry %d/%d",
-                    source, data.name, data.gearscore or 0,
-                    hasItems and "present" or "empty",
+                local reason = not hasItems and "no items"
+                            or (data.gearscore or 0) == 0 and "gs=0"
+                            or bareLinks and "bare links"
+                            or "no talents"
+                dprint(string.format("[RI] %s – '%s' returned incomplete data (%s, gs=%.0f) – retry %d/%d",
+                    source, data.name, reason, data.gearscore or 0,
                     retries + 1, MAX_INSPECT_RETRIES))
                 -- Wait INSPECT_RETRY_DELAY seconds before re-inspecting to allow item/gear cache to
                 -- populate on the server side.  Validate the unit token still maps
@@ -931,8 +969,8 @@ local function FinishInspect(source)
     inspecting    = nil
     inspectingGUID = nil
 
-    -- Minimum 3 second gap between player inspects to respect server throttling.
-    scheduleNextInspect(3)
+    -- Minimum inter-inspect gap before the next player.
+    scheduleNextInspect(INTER_INSPECT_DELAY)
 end
 
 function RaidInspect:INSPECT_READY(_, guid)
