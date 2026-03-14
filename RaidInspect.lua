@@ -76,7 +76,7 @@ local DATA_RESP_MSG  = "DD"         -- response with full player data
 
 -- UI sizing
 local WINDOW_W      = 560
-local WINDOW_H      = 476     -- 450 content + 26 for the scale-slider row
+local WINDOW_H      = 476     -- 450px of list area + 26px scale-slider row
 local SCALE_ROW_H   = 26      -- height of the item/talent scale slider row
 local ROW_H         = 18
 local HEADER_H      = 22
@@ -524,7 +524,7 @@ local function GetGemInfo(link)
 end
 
 -- ============================================================
--- Data collection (called immediately after INSPECT_READY)
+-- Data collection (called after INSPECT_TALENT_READY)
 -- ============================================================
 
 local function CollectData(unit)
@@ -744,23 +744,20 @@ NextInspect = function()
     -- LGT delegates to LibTalentQuery which serialises all NotifyInspect calls
     -- across every addon using LGT, preventing duplicate inspect requests and
     -- the server-side rate-limiting that comes from multiple addons each calling
-    -- NotifyInspect independently.  When LGT is absent, fall back to InspectUnit.
+    -- NotifyInspect independently.  When LGT is absent, fall back to NotifyInspect.
+    -- On WotLK 3.3.5, NotifyInspect fires INSPECT_TALENT_READY (not INSPECT_READY)
+    -- and makes inventory link data available immediately; gem data arrives after
+    -- UNIT_INVENTORY_CHANGED.  We only listen for INSPECT_TALENT_READY.
     if LGT then
         dprint(string.format("[RI] Requesting inspect for '%s' via LGT (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
         LGT:GetUnitTalents(unit, true)
     else
-        -- Hide InspectFrame before calling InspectUnit to suppress the popup.
-        -- InspectUnit populates GetInventoryItemLink data and fires INSPECT_READY,
-        -- while keeping InspectFrame invisible to the user during the scan.
-        if InspectFrame then InspectFrame:Hide() end
-        dprint(string.format("[RI] Calling InspectUnit on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
-        InspectUnit(unit)
-        -- Immediately re-hide in case InspectUnit triggered a Show script.
-        if InspectFrame then InspectFrame:Hide() end
+        dprint(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        NotifyInspect(unit)
     end
 
-    -- Failsafe timeout so we never get stuck if neither INSPECT_READY nor
-    -- INSPECT_TALENT_READY fires (e.g. unit went offline mid-scan).
+    -- Failsafe timeout so we never get stuck if INSPECT_TALENT_READY never fires
+    -- (e.g. unit went offline mid-scan or the server throttled the request).
     if inspTimer then RaidInspect:CancelTimer(inspTimer) end
     inspTimer = RaidInspect:ScheduleTimer(function()
         dprint(string.format("[RI] Inspect TIMEOUT for '%s' – moving on", tostring(inspecting)))
@@ -858,7 +855,7 @@ end
 -- Event: inspection data ready
 -- ============================================================
 
--- Shared logic executed by both INSPECT_READY and INSPECT_TALENT_READY once
+-- Shared logic executed by INSPECT_TALENT_READY (or the LGT callback) once
 -- inspect data is confirmed to be ready for the unit we are waiting on.
 -- "source" is the triggering event name, used only in debug print messages.
 local function FinishInspect(source)
@@ -924,9 +921,6 @@ local function FinishInspect(source)
     end
 
     ClearInspectPlayer()
-    -- Close the InspectFrame that was opened by InspectUnit (non-LGT path) so
-    -- the user does not see a leftover popup after each scan step.
-    if not LGT and InspectFrame then InspectFrame:Hide() end
     inspecting    = nil
     inspectingGUID = nil
 
@@ -934,25 +928,9 @@ local function FinishInspect(source)
     scheduleNextInspect(INTER_INSPECT_DELAY)
 end
 
-function RaidInspect:INSPECT_READY(_, guid)
-    dprint(string.format("[RI] INSPECT_READY fired – guid=%s inspecting=%s", tostring(guid), tostring(inspecting)))
-    if not inspecting then
-        dprint("[RI] INSPECT_READY – no active inspection, ignoring")
-        return
-    end
-    if guid and guid ~= UnitGUID(inspecting) then
-        dprint(string.format("[RI] INSPECT_READY – GUID mismatch (expected %s, got %s), ignoring", tostring(UnitGUID(inspecting)), tostring(guid)))
-        return
-    end
-    FinishInspect("INSPECT_READY")
-end
-
--- On WotLK private servers (e.g. Warmane/TrinityCore) the server fires
--- INSPECT_TALENT_READY instead of (or before) INSPECT_READY.  This is the same
--- event that LibTalentQuery-1.0 (used by LibGroupTalents) listens to.
--- INSPECT_TALENT_READY carries no GUID argument, so we validate using the GUID
--- captured at NotifyInspect time.  On servers that fire both events, whichever
--- arrives first will nil out `inspecting`; the second is then ignored.
+-- On WotLK 3.3.5, NotifyInspect fires INSPECT_TALENT_READY (not INSPECT_READY —
+-- that event is Cataclysm+).  INSPECT_TALENT_READY carries no GUID argument, so
+-- we validate using the GUID captured at NotifyInspect time.
 -- When LGT is available it fires LibGroupTalents_Update before this handler
 -- runs (LibTalentQuery was loaded earlier), so this only acts as a fallback
 -- for the LGT-less code path.
@@ -1755,9 +1733,8 @@ function RaidInspect:CreateMainFrame()
         local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         lbl:SetText(labelText)
         -- Align the label vertically centred within the scale-slider row.
-        -- 22 = button height of the first row (scanBtn/dataBtn), used as anchor reference.
-        local BTN_ROW_H = 22
-        lbl:SetPoint("TOPLEFT", xAnchor, "BOTTOMLEFT", 0, -(SCALE_ROW_H - BTN_ROW_H) / 2 - 4)
+        -- HEADER_H (22px) matches the button height of the first row (scanBtn/dataBtn).
+        lbl:SetPoint("TOPLEFT", xAnchor, "BOTTOMLEFT", 0, -(SCALE_ROW_H - HEADER_H) / 2 - 4)
 
         local sliderName = "RaidInspect_ScaleSlider_" .. initKey
         local sl = CreateFrame("Slider", sliderName, f, "OptionsSliderTemplate")
@@ -1875,13 +1852,11 @@ function RaidInspect:OnInitialize()
 end
 
 function RaidInspect:OnEnable()
-    self:RegisterEvent("INSPECT_READY")
-    -- On WotLK private servers (e.g. Warmane) the server fires
-    -- INSPECT_TALENT_READY instead of INSPECT_READY.  Register both so the
-    -- scan works regardless of which event the server actually delivers.
+    -- On WotLK 3.3.5, INSPECT_READY does not fire — only INSPECT_TALENT_READY does.
+    -- (INSPECT_READY was introduced in Cataclysm.)  Register only INSPECT_TALENT_READY.
     -- When LGT is available, LibGroupTalents_Update fires first (because
-    -- LibTalentQuery was loaded before us), making these handlers act as a
-    -- fallback for the LGT-less code path only.
+    -- LibTalentQuery was loaded before us), making this handler act as a fallback
+    -- for the LGT-less code path only.
     self:RegisterEvent("INSPECT_TALENT_READY")
     -- Hook into LibGroupTalents so we can piggyback on its unified inspect
     -- queue rather than issuing duplicate NotifyInspect calls ourselves.
