@@ -6,3 +6,4 @@ What works: calculating gs, getting items, talents, glyphs (if they have an addo
 What doesn't work: getting gems
 
 wrath has bad API. it do be like that
+
