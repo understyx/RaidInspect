@@ -7,3 +7,4 @@ What doesn't work: getting gems
 
 wrath has bad API. it do be like that
 
+it also messes up normal inspect, because of the rate limit
