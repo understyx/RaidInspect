@@ -87,8 +87,6 @@ local SOCKET_TEXTS = {
 }
 
 local COMM_PREFIX    = "RI1"        -- kept ≤ 16 chars for ChatThrottle
-local GLYPH_REQ_MSG  = "GR"
-local GLYPH_RESP_MSG = "GD"
 local DATA_REQ_MSG   = "DR"         -- request full gear/talent/glyph data
 local DATA_RESP_MSG  = "DD"         -- response with full player data
 
@@ -424,6 +422,28 @@ local function hasOnlyBareLinks(items)
     return count > 0
 end
 
+-- Builds the internal glyph table from LibGroupTalents' stored data for a unit.
+-- LGT returns up to 6 glyph spell IDs (sockets 1-6 of the active talent group).
+-- In WotLK, sockets 1-3 are Major glyphs (glyphType = 1) and 4-6 are Minor
+-- (glyphType = 2).  Returns nil when LGT is absent or has no data for the unit.
+local function GlyphsFromLGT(unit)
+    if not LGT then return nil end
+    local a, b, c, d, e, f = LGT:GetUnitGlyphs(unit)
+    local spells = {a, b, c, d, e, f}
+    local glyphs = {}
+    for socket, spellID in ipairs(spells) do
+        if spellID and spellID > 0 then
+            local _, _, icon = GetSpellInfo(spellID)
+            glyphs[socket] = {
+                spellID   = spellID,
+                icon      = icon,
+                glyphType = socket <= 3 and 1 or 2,
+            }
+        end
+    end
+    return next(glyphs) and glyphs or nil
+end
+
 -- Returns (filledCount, totalSocketCount) for an item link.
 -- totalSocketCount is determined from a hidden tooltip scan so it works
 -- for items with any combination of socket colours.
@@ -630,16 +650,27 @@ local function CollectData(unit)
     end
 
     -- Talent point distribution across the three trees.
-    -- Pass isnotplayer so we read the inspected unit's talents rather than
-    -- the player's own; for "player" both values are equivalent.
+    -- When LibGroupTalents is available and this is not the local player, read
+    -- from LGT's stored data (which is guaranteed current once LibGroupTalents_
+    -- Update has fired).  Fall back to the raw WoW inspect-buffer API otherwise.
     local isnotplayer = not UnitIsUnit(unit, "player")
     local talentData  = {0, 0, 0}
     local talentPoints = {}          -- [talentName] = currentRank (> 0 only)
-    local numTabs = (GetNumTalentTabs and GetNumTalentTabs(isnotplayer)) or 3
-    for tab = 1, math.min(numTabs, 3) do
-        local numTalents = (GetNumTalents and GetNumTalents(tab, isnotplayer)) or 0
+    local numTabs = 3                -- WotLK always has exactly 3 talent trees
+    for tab = 1, numTabs do
+        local numTalents
+        if LGT and isnotplayer then
+            numTalents = LGT:GetNumTalents(unit, tab) or 0
+        else
+            numTalents = (GetNumTalents and GetNumTalents(tab, isnotplayer)) or 0
+        end
         for idx = 1, numTalents do
-            local talName, _, _, _, rank = GetTalentInfo(tab, idx, isnotplayer)
+            local talName, _, _, _, rank
+            if LGT and isnotplayer then
+                talName, _, _, _, rank = LGT:GetTalentInfo(unit, tab, idx)
+            else
+                talName, _, _, _, rank = GetTalentInfo(tab, idx, isnotplayer)
+            end
             talentData[tab] = (talentData[tab] or 0) + (rank or 0)
             if talName and rank and rank > 0 then
                 talentPoints[talName] = rank
@@ -647,10 +678,11 @@ local function CollectData(unit)
         end
     end
 
-    -- Glyph data (major + minor, sockets 1-6)
-    -- GetGlyphSocketInfo(socketID, talentGroup, isInspect) — WotLK 3.3.5 API.
-    -- Pass isnotplayer as the isInspect flag so that we read the INSPECTED
-    -- unit's glyphs rather than always reading the local player's own glyphs.
+    -- Glyph data (major + minor, sockets 1-6).
+    -- Primary source: GetGlyphSocketInfo reads from the WoW inspect buffer which
+    -- is populated while the inspect is still open.
+    -- Fallback: LGT's stored glyph data (received via its own comm protocol from
+    -- other players running LibGroupTalents) when the inspect buffer is empty.
     -- glyphType == 1 → Major glyph; glyphType == 2 → Minor glyph
     local glyphs = {}
     for socket = 1, 6 do
@@ -662,6 +694,11 @@ local function CollectData(unit)
                 glyphType = glyphType,
             }
         end
+    end
+    -- If the inspect buffer had no glyph data, try LGT's stored glyphs.
+    if not next(glyphs) and isnotplayer then
+        local lgtGlyphs = GlyphsFromLGT(unit)
+        if lgtGlyphs then glyphs = lgtGlyphs end
     end
 
     local glyphCount = 0
@@ -715,13 +752,12 @@ NextInspect = function()
         inspecting    = nil
         inspectingGUID = nil
         dprint("[RI] Queue empty – scan complete")
-        -- When the queue drains, send a group-wide data+glyph request if any
-        -- player was skipped (out of range) or had missing/changed data.
+        -- When the queue drains, send a group-wide data request if any player
+        -- was skipped (out of range) or had missing/changed data.
         if pendingCommRequest then
             pendingCommRequest = false
-            dprint("[RI] Sending deferred comm request (data + glyphs)")
+            dprint("[RI] Sending deferred data comm request")
             RaidInspect:RequestData(true)   -- silent = true (no chat spam)
-            RaidInspect:RequestGlyphs(true)
         end
         return
     end
@@ -768,8 +804,19 @@ NextInspect = function()
 
     inspecting    = unit
     inspectingGUID = UnitGUID(unit)
-    dprint(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
-    NotifyInspect(unit)
+    -- When LibGroupTalents is available, route the inspect request through it.
+    -- LGT delegates to LibTalentQuery which serialises all NotifyInspect calls
+    -- across every addon using LGT, preventing duplicate inspect requests and
+    -- the server-side rate-limiting that comes from multiple addons each calling
+    -- NotifyInspect independently.  When LGT is absent, fall back to our own
+    -- NotifyInspect call.
+    if LGT then
+        dprint(string.format("[RI] Requesting inspect for '%s' via LGT (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        LGT:GetUnitTalents(unit, true)
+    else
+        dprint(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        NotifyInspect(unit)
+    end
 
     -- Failsafe timeout so we never get stuck if neither INSPECT_READY nor
     -- INSPECT_TALENT_READY fires (e.g. unit went offline mid-scan).
@@ -888,23 +935,18 @@ local function FinishInspect(source)
         local oldData = cache[data.name]
 
         -- Decide whether a group-wide comm request is needed for this player.
-        -- Request if: glyphs are missing after inspection, OR gear/talents
-        -- changed since the last scan (the remote data may have newer glyphs).
-        if not pendingCommRequest then
-            if not data.glyphs or not next(data.glyphs) then
-                dprint(string.format("[RI] %s – '%s' has no glyphs, flagging deferred comm request", source, tostring(data.name)))
+        -- Request if gear or talents changed since the last scan (the remote
+        -- data may have been updated by the player since we last saw them).
+        if not pendingCommRequest and oldData then
+            if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
+                dprint(string.format("[RI] %s – '%s' gearscore changed (%.0f→%.0f), flagging deferred comm request", source, tostring(data.name), oldData.gearscore or 0, data.gearscore or 0))
                 pendingCommRequest = true
-            elseif oldData then
-                if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
-                    dprint(string.format("[RI] %s – '%s' gearscore changed (%.0f→%.0f), flagging deferred comm request", source, tostring(data.name), oldData.gearscore or 0, data.gearscore or 0))
-                    pendingCommRequest = true
-                elseif oldData.talentData and data.talentData then
-                    for i = 1, 3 do
-                        if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
-                            dprint(string.format("[RI] %s – '%s' talent tree %d changed, flagging deferred comm request", source, tostring(data.name), i))
-                            pendingCommRequest = true
-                            break
-                        end
+            elseif oldData.talentData and data.talentData then
+                for i = 1, 3 do
+                    if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
+                        dprint(string.format("[RI] %s – '%s' talent tree %d changed, flagging deferred comm request", source, tostring(data.name), i))
+                        pendingCommRequest = true
+                        break
                     end
                 end
             end
@@ -992,6 +1034,9 @@ end
 -- INSPECT_TALENT_READY carries no GUID argument, so we validate using the GUID
 -- captured at NotifyInspect time.  On servers that fire both events, whichever
 -- arrives first will nil out `inspecting`; the second is then ignored.
+-- When LGT is available it fires LibGroupTalents_Update before this handler
+-- runs (LibTalentQuery was loaded earlier), so this only acts as a fallback
+-- for the LGT-less code path.
 function RaidInspect:INSPECT_TALENT_READY()
     dprint(string.format("[RI] INSPECT_TALENT_READY fired – inspecting=%s", tostring(inspecting)))
     if not inspecting then
@@ -1007,7 +1052,39 @@ function RaidInspect:INSPECT_TALENT_READY()
 end
 
 -- ============================================================
--- AceComm: glyph request / response
+-- LibGroupTalents callbacks
+-- ============================================================
+
+-- Fired by LGT when fresh talent data arrives for any roster member.
+-- When it matches the unit we are currently waiting on, it drives FinishInspect
+-- instead of the raw INSPECT_TALENT_READY event, so only ONE NotifyInspect per
+-- player is ever issued (via LibTalentQuery's serialised inspect queue).
+function RaidInspect:OnLGTUpdate(_, guid, unit)
+    if not inspecting or guid ~= inspectingGUID then return end
+    dprint(string.format("[RI] LibGroupTalents_Update – '%s' GUID=%s matches, finishing inspect", tostring(unit), tostring(guid)))
+    FinishInspect("LGT:Update")
+end
+
+-- Fired by LGT when glyph data arrives for a group member via LGT's own comm
+-- protocol (independent of our inspect buffer).  Update the cache entry and
+-- refresh the table so the talent hover frame shows the latest glyphs.
+function RaidInspect:OnLGTGlyphUpdate(_, guid, unit)
+    if not unit or not guid then return end
+    local name, realm = UnitName(unit)
+    if realm and realm ~= "" then name = name.."-"..realm end
+    if not name or name == "Unknown" then return end
+    local data = cache[name]
+    if not data then return end
+    local newGlyphs = GlyphsFromLGT(unit)
+    if newGlyphs then
+        data.glyphs = newGlyphs
+        dprint(string.format("[RI] LibGroupTalents_GlyphUpdate – updated glyphs for '%s'", name))
+        self:RefreshTable()
+    end
+end
+
+-- ============================================================
+-- AceComm: data request / response (for out-of-range players)
 -- ============================================================
 
 function RaidInspect:OnCommReceived(prefix, message, _, sender)
@@ -1015,23 +1092,7 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
 
     local AceSerializer = LibStub("AceSerializer-3.0")
 
-    if message == GLYPH_REQ_MSG then
-        -- Respond with our own glyph data
-        local myGlyphs = {}
-        for socket = 1, 6 do
-            local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
-            if glyphSpellID and glyphSpellID > 0 then
-                myGlyphs[socket] = {
-                    spellID   = glyphSpellID,
-                    icon      = icon,
-                    glyphType = glyphType,
-                }
-            end
-        end
-        local payload = AceSerializer:Serialize(GLYPH_RESP_MSG, myGlyphs)
-        self:SendCommMessage(COMM_PREFIX, payload, "WHISPER", sender)
-
-    elseif message == DATA_REQ_MSG then
+    if message == DATA_REQ_MSG then
         -- Respond with our own complete gear / talent / glyph data so that the
         -- requester can inspect us even when we are out of their inspect range.
         local myData = CollectData("player")
@@ -1052,23 +1113,11 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
         end
 
     else
-        -- Try to deserialise as a glyph response or a full data response
+        -- Try to deserialise as a full data response
         local ok, msgType, payload = AceSerializer:Deserialize(message)
         if not ok then return end
 
-        if msgType == GLYPH_RESP_MSG then
-            -- Match sender to a cache entry (strip realm suffix for comparison)
-            local senderBase = sender:match("^([^%-]+)") or sender
-            for name, data in pairs(cache) do
-                local nameBase = name:match("^([^%-]+)") or name
-                if nameBase:lower() == senderBase:lower() then
-                    data.glyphs = payload
-                    self:RefreshTable()
-                    break
-                end
-            end
-
-        elseif msgType == DATA_RESP_MSG then
+        if msgType == DATA_RESP_MSG then
             -- Full player data response — merge into cache.
             -- The sender reports their OWN data, so it is authoritative.
             local incoming = payload
@@ -1087,16 +1136,6 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
             end
             self:RefreshTable()
         end
-    end
-end
-
--- silent suppresses the chat confirmation (used for auto-triggered requests)
-function RaidInspect:RequestGlyphs(silent)
-    local numRaid = GetNumRaidMembers()
-    local channel = numRaid > 0 and "RAID" or "PARTY"
-    self:SendCommMessage(COMM_PREFIX, GLYPH_REQ_MSG, channel)
-    if not silent then
-        self:Print("Requested glyph data from raid/party members running RaidInspect.")
     end
 end
 
@@ -1918,19 +1957,11 @@ function RaidInspect:CreateMainFrame()
     end)
     ns.SkinFlatButton(cfgBtn)
 
-    -- Glyph-request button
-    local glyphBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    glyphBtn:SetSize(110, 22)
-    glyphBtn:SetPoint("LEFT", cfgBtn, "RIGHT", 4, 0)
-    glyphBtn:SetText("Request Glyphs")
-    glyphBtn:SetScript("OnClick", function() RaidInspect:RequestGlyphs() end)
-    ns.SkinFlatButton(glyphBtn)
-
     -- Request Data button — asks out-of-range addon users to share their
     -- gear, talent, and glyph data via AceComm.
     local dataBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     dataBtn:SetSize(100, 22)
-    dataBtn:SetPoint("LEFT", glyphBtn, "RIGHT", 4, 0)
+    dataBtn:SetPoint("LEFT", cfgBtn, "RIGHT", 4, 0)
     dataBtn:SetText("Request Data")
     dataBtn:SetScript("OnClick", function() RaidInspect:RequestData() end)
     ns.SkinFlatButton(dataBtn)
@@ -2114,18 +2145,30 @@ function RaidInspect:OnEnable()
     -- On WotLK private servers (e.g. Warmane) the server fires
     -- INSPECT_TALENT_READY instead of INSPECT_READY.  Register both so the
     -- scan works regardless of which event the server actually delivers.
+    -- When LGT is available, LibGroupTalents_Update fires first (because
+    -- LibTalentQuery was loaded before us), making these handlers act as a
+    -- fallback for the LGT-less code path only.
     self:RegisterEvent("INSPECT_TALENT_READY")
+    -- Hook into LibGroupTalents so we can piggyback on its unified inspect
+    -- queue rather than issuing duplicate NotifyInspect calls ourselves.
+    if LGT then
+        LGT.RegisterCallback(self, "LibGroupTalents_Update",      "OnLGTUpdate")
+        LGT.RegisterCallback(self, "LibGroupTalents_GlyphUpdate", "OnLGTGlyphUpdate")
+    end
     -- Automatically re-scan whenever the group roster changes so that new
     -- members are inspected without requiring a manual /ri scan.
     self:RegisterEvent("RAID_ROSTER_UPDATE")
     self:RegisterEvent("PARTY_MEMBERS_CHANGED")
-    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri data · /ri config")
+    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri data · /ri config")
     -- If we are already in a group when the addon loads, kick off scanning
     -- immediately without waiting for a roster-change event or manual /ri scan.
     self:AutoScan()
 end
 
 function RaidInspect:OnDisable()
+    if LGT then
+        LGT.UnregisterAllCallbacks(self)
+    end
     wipe(cache)
     wipe(inspQueue)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
@@ -2150,8 +2193,6 @@ function RaidInspect:SlashCommand(input)
         self:ScanRaid()
     elseif cmd == "config" then
         LibStub("AceConfigDialog-3.0"):Open(addonName)
-    elseif cmd == "glyphs" then
-        self:RequestGlyphs()
     elseif cmd == "data" then
         self:RequestData()
     else
