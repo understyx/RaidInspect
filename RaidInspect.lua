@@ -5,15 +5,11 @@ local addonName, ns = ...
 --
 -- Inspects every member of the current raid/party and populates a scrollable
 -- table with:  Name · Guild · GearScore · Items (hover) · Talents (hover)
---             · Spec ✓  · Gemmed ✓ · Enchanted ✓
+--             · Gemmed ✓ · Enchanted ✓
 --
--- Rows are tinted with the player's class colour.  Per-class acceptable specs
--- are configured via AceConfig toggles and shown as checkmarks in the table.
--- Per-talent required/excluded filters can additionally be set through the
--- talent-filter editor (opened via "Edit Talent Filters" per class in Config).
---
--- AceComm (COMM_PREFIX "RI1") is used to request glyph data from other users
--- of the addon in the same group.
+-- Rows are tinted with the player's class colour.
+-- AceComm (COMM_PREFIX "RI1") is used to share full gear/talent data with
+-- out-of-range group members running the addon.
 -------------------------------------------------------------------------------
 
 local RaidInspect = LibStub("AceAddon-3.0"):NewAddon(addonName,
@@ -55,18 +51,6 @@ local CLASS_SPEC_NAMES = {
     DRUID       = {"Balance",     "Feral Combat",   "Restoration"},
 }
 
-local CLASS_LOCAL_NAMES = {
-    WARRIOR="Warrior",   PALADIN="Paladin",   HUNTER="Hunter",
-    ROGUE="Rogue",       PRIEST="Priest",     DEATHKNIGHT="Death Knight",
-    SHAMAN="Shaman",     MAGE="Mage",         WARLOCK="Warlock",
-    DRUID="Druid",
-}
-
-local CLASS_ORDER = {
-    "WARRIOR","PALADIN","HUNTER","ROGUE","PRIEST",
-    "DEATHKNIGHT","SHAMAN","MAGE","WARLOCK","DRUID",
-}
-
 -- Inventory slots to inspect (skip shirt=4)
 local GEAR_SLOTS = {1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18}
 
@@ -87,14 +71,13 @@ local SOCKET_TEXTS = {
 }
 
 local COMM_PREFIX    = "RI1"        -- kept ≤ 16 chars for ChatThrottle
-local GLYPH_REQ_MSG  = "GR"
-local GLYPH_RESP_MSG = "GD"
 local DATA_REQ_MSG   = "DR"         -- request full gear/talent/glyph data
 local DATA_RESP_MSG  = "DD"         -- response with full player data
 
 -- UI sizing
 local WINDOW_W      = 560
-local WINDOW_H      = 450
+local WINDOW_H      = 476     -- 450px of list area + 26px scale-slider row
+local SCALE_ROW_H   = 26      -- height of the item/talent scale slider row
 local ROW_H         = 18
 local HEADER_H      = 22
 local COL_NAME      = 120
@@ -102,11 +85,10 @@ local COL_GUILD     = 100
 local COL_GS        = 55
 local COL_ITEMS     = 46
 local COL_TALENTS   = 78
-local COL_SPEC      = 32
 local COL_GEMMED    = 38
 local COL_ENCHANTED = 46
 local COL_TOTAL = COL_NAME + COL_GUILD + COL_GS + COL_ITEMS
-               + COL_TALENTS + COL_SPEC + COL_GEMMED + COL_ENCHANTED
+               + COL_TALENTS + COL_GEMMED + COL_ENCHANTED
 
 local ICON_CHECK    = "Interface\\RaidFrame\\ReadyCheck-Ready"
 local ICON_CROSS    = "Interface\\RaidFrame\\ReadyCheck-NotReady"
@@ -335,11 +317,10 @@ end
 
 local defaults = {
     profile = {
-        acceptableSpecs = {},   -- [class] = {[1]=bool,[2]=bool,[3]=bool}
-        talentFilters   = {},   -- [class] = {[talentName]=true/false}
-        gsThreshold     = 5000,
-        windowX         = 0,
-        windowY         = 0,
+        windowX          = 0,
+        windowY          = 0,
+        itemFrameScale   = 1.0,
+        talentFrameScale = 1.0,
     },
 }
 
@@ -350,9 +331,26 @@ local defaults = {
 local cache              = {}     -- [playerName] = data record
 local inspQueue          = {}     -- list of unit tokens queued for inspection
 local inspecting         = nil    -- unit token currently being inspected
-local inspTimer          = nil    -- timeout timer handle (5-second failsafe)
-local inspDelayTimer     = nil    -- handle for the 0.5-second inter-inspect delay timer
+local inspTimer          = nil    -- timeout timer handle
+local inspDelayTimer     = nil    -- handle for the inter-inspect delay timer
+local inspectingGUID     = nil    -- GUID of the inspected unit captured at NotifyInspect time;
+                                  -- used to validate INSPECT_TALENT_READY which carries no GUID arg
 local pendingCommRequest = false  -- true when a group-wide data/glyph request is needed
+local inspRetries        = {}     -- [playerName] = retry count for no-item-data re-inspects
+local MAX_INSPECT_RETRIES  = 9    -- re-inspect at most this many times when item data is missing
+                                  -- (1 initial attempt + 9 retries = 10 total scan attempts per player)
+local INSPECT_RETRY_DELAY  = 3    -- seconds to wait before a retry inspect (gives server time to push data)
+local INTER_INSPECT_DELAY  = 3    -- minimum seconds between consecutive player-to-player inspect transitions
+local INSPECT_TIMEOUT      = 10   -- seconds before giving up on a non-responding inspect
+local POST_TIMEOUT_DELAY   = 2.0  -- seconds to wait after a timeout before trying the next player
+
+-- Set to true to enable verbose [RI] diagnostic messages in the chat frame.
+-- These are intentionally off by default; they are only needed when debugging
+-- inspect queue or data-collection issues.
+local DEBUG = false
+local function dprint(s)
+    if DEBUG then RaidInspect:Print(s) end
+end
 
 -- Hidden tooltip used to count socket slots on item links
 local scanTip = CreateFrame("GameTooltip", "RaidInspect_ScanTip",
@@ -385,6 +383,28 @@ local function ParseLink(link)
     local t = {}
     for p in s:gmatch("[^:]+") do t[#t+1] = p end
     return t
+end
+
+-- Builds the internal glyph table from LibGroupTalents' stored data for a unit.
+-- LGT returns up to 6 glyph spell IDs (sockets 1-6 of the active talent group).
+-- In WotLK, sockets 1-3 are Major glyphs (glyphType = 1) and 4-6 are Minor
+-- (glyphType = 2).  Returns nil when LGT is absent or has no data for the unit.
+local function GlyphsFromLGT(unit)
+    if not LGT then return nil end
+    local a, b, c, d, e, f = LGT:GetUnitGlyphs(unit)
+    local spells = {a, b, c, d, e, f}
+    local glyphs = {}
+    for socket, spellID in ipairs(spells) do
+        if spellID and spellID > 0 then
+            local _, _, icon = GetSpellInfo(spellID)
+            glyphs[socket] = {
+                spellID   = spellID,
+                icon      = icon,
+                glyphType = socket <= 3 and 1 or 2,
+            }
+        end
+    end
+    return next(glyphs) and glyphs or nil
 end
 
 -- Returns (filledCount, totalSocketCount) for an item link.
@@ -445,6 +465,9 @@ end
 -- Instead, we scan the hidden tooltip: enchant descriptions appear as bright-green
 -- lines that do NOT carry the "Equip:" or "Use:" prefix used by the item's own
 -- built-in bonus effects.
+-- Excluded patterns (not real enchants):
+--   "Heroic"            — quality badge on heroic items
+--   "[digits] Armor"    — armour value line (e.g. "1234 Armor")
 local function GetEnchantText(link)
     local parts = ParseLink(link)
     if not parts then return nil end
@@ -462,10 +485,14 @@ local function GetEnchantText(link)
             local r, g, b = lineL:GetTextColor()
             -- Enchant lines are bright lime-green (R < 0.25, G > 0.75, B < 0.15)
             -- and do NOT start with "Equip:" or "Use:" (item-own bonus lines).
+            -- Also skip the "Heroic" quality badge and bare armour-value lines
+            -- (e.g. "1234 Armor") which share the same green colour.
             if r and g and b
             and r < 0.25 and g > 0.75 and b < 0.15
             and not txt:match("^Equip:")
             and not txt:match("^Use:")
+            and txt ~= "Heroic"
+            and not txt:match("^%d+ Armor$")
             and txt ~= "" then
                 result = txt
                 break
@@ -497,66 +524,22 @@ local function GetGemInfo(link)
 end
 
 -- ============================================================
--- Talent helpers
--- ============================================================
-
--- Returns the index of the tree with the most points and the
--- three-element point array {tree1, tree2, tree3}.
-local function PrimarySpec(talentData)
-    if not talentData then return 1, {0,0,0} end
-    local maxPts, primary = 0, 1
-    for i = 1, 3 do
-        if (talentData[i] or 0) > maxPts then
-            maxPts  = talentData[i]
-            primary = i
-        end
-    end
-    return primary, talentData
-end
-
--- Returns true/false/nil (yes/no/not-configured) for whether the
--- inspected player's primary spec is in the acceptable-spec list.
-local function IsSpecAcceptable(class, talentData)
-    if not class or not talentData then return nil end
-    local cfg = RaidInspect.db and RaidInspect.db.profile.acceptableSpecs[class]
-    if not cfg then return nil end
-    -- Check if the user has configured anything for this class
-    local hasAny = false
-    for i = 1, 3 do
-        if cfg[i] ~= nil then hasAny = true; break end
-    end
-    if not hasAny then return nil end
-    local primary = PrimarySpec(talentData)
-    return cfg[primary] == true
-end
-
--- Returns true/false/nil (all-pass/any-fail/not-configured) for whether
--- the inspected player's per-talent point counts satisfy the saved filters.
--- Filters: true = talent must have at least 1 rank; false = must have 0 ranks.
-local function IsTalentFilterSatisfied(class, talentPoints)
-    if not class or not talentPoints then return nil end
-    local db = RaidInspect.db and RaidInspect.db.profile
-    if not db then return nil end
-    local classFilter = db.talentFilters and db.talentFilters[class]
-    if not classFilter or not next(classFilter) then return nil end
-    for talentName, required in pairs(classFilter) do
-        local rank = talentPoints[talentName] or 0
-        if required == true  and rank == 0 then return false end
-        if required == false and rank >  0 then return false end
-    end
-    return true
-end
-
--- ============================================================
--- Data collection (called immediately after INSPECT_READY)
+-- Data collection (called after INSPECT_TALENT_READY)
 -- ============================================================
 
 local function CollectData(unit)
-    if not unit or not UnitIsPlayer(unit) then return nil end
+    if not unit or not UnitIsPlayer(unit) then
+        dprint(string.format("[RI] CollectData('%s') – not a player unit, aborting", tostring(unit)))
+        return nil
+    end
 
     local name, realm = UnitName(unit)
     if realm and realm ~= "" then name = name.."-"..realm end
-    if not name or name == "Unknown" then return nil end
+    if not name or name == "Unknown" then
+        dprint(string.format("[RI] CollectData('%s') – name is '%s', aborting", tostring(unit), tostring(name)))
+        return nil
+    end
+    dprint(string.format("[RI] CollectData: collecting data for '%s'", tostring(name)))
 
     local _, class = UnitClass(unit)
     local guild     = GetGuildInfo(unit) or ""
@@ -586,16 +569,27 @@ local function CollectData(unit)
     end
 
     -- Talent point distribution across the three trees.
-    -- Pass isnotplayer so we read the inspected unit's talents rather than
-    -- the player's own; for "player" both values are equivalent.
+    -- When LibGroupTalents is available and this is not the local player, read
+    -- from LGT's stored data (which is guaranteed current once LibGroupTalents_
+    -- Update has fired).  Fall back to the raw WoW inspect-buffer API otherwise.
     local isnotplayer = not UnitIsUnit(unit, "player")
     local talentData  = {0, 0, 0}
     local talentPoints = {}          -- [talentName] = currentRank (> 0 only)
-    local numTabs = (GetNumTalentTabs and GetNumTalentTabs(isnotplayer)) or 3
-    for tab = 1, math.min(numTabs, 3) do
-        local numTalents = (GetNumTalents and GetNumTalents(tab, isnotplayer)) or 0
+    local numTabs = 3                -- WotLK always has exactly 3 talent trees
+    for tab = 1, numTabs do
+        local numTalents
+        if LGT and isnotplayer then
+            numTalents = LGT:GetNumTalents(unit, tab) or 0
+        else
+            numTalents = (GetNumTalents and GetNumTalents(tab, isnotplayer)) or 0
+        end
         for idx = 1, numTalents do
-            local talName, _, _, _, rank = GetTalentInfo(tab, idx, isnotplayer)
+            local talName, _, _, _, rank
+            if LGT and isnotplayer then
+                talName, _, _, _, rank = LGT:GetTalentInfo(unit, tab, idx)
+            else
+                talName, _, _, _, rank = GetTalentInfo(tab, idx, isnotplayer)
+            end
             talentData[tab] = (talentData[tab] or 0) + (rank or 0)
             if talName and rank and rank > 0 then
                 talentPoints[talName] = rank
@@ -603,23 +597,53 @@ local function CollectData(unit)
         end
     end
 
-    -- Glyph data (major + minor, sockets 1-6)
-    -- GetGlyphSocketInfo(socketID, talentGroup, isInspect) — WotLK 3.3.5 API.
-    -- Pass isnotplayer as the isInspect flag so that we read the INSPECTED
-    -- unit's glyphs rather than always reading the local player's own glyphs.
+    -- Glyph data (major + minor, sockets 1-6).
+    -- For non-local players, prefer LGT's stored glyph data (received via
+    -- LGT's own comm protocol, which is more reliable than the inspect buffer
+    -- on private servers where GetGlyphSocketInfo with isnotplayer=true can
+    -- return the local player's own glyphs instead of the inspected player's).
+    -- Fall back to the inspect buffer only when LGT has no data for this unit.
+    -- For the local player, always read directly from the API.
     -- glyphType == 1 → Major glyph; glyphType == 2 → Minor glyph
     local glyphs = {}
-    for socket = 1, 6 do
-        local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket, 1, isnotplayer)
-        if glyphSpellID and glyphSpellID > 0 then
-            glyphs[socket] = {
-                spellID   = glyphSpellID,
-                icon      = icon,
-                glyphType = glyphType,
-            }
+    if isnotplayer then
+        local lgtGlyphs = GlyphsFromLGT(unit)
+        if lgtGlyphs then
+            glyphs = lgtGlyphs
+        else
+            -- Fallback: inspect buffer (may not be accurate on all servers)
+            for socket = 1, 6 do
+                local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket, 1, true)
+                if glyphSpellID and glyphSpellID > 0 then
+                    glyphs[socket] = {
+                        spellID   = glyphSpellID,
+                        icon      = icon,
+                        glyphType = glyphType,
+                    }
+                end
+            end
+        end
+    else
+        -- Local player: read directly
+        for socket = 1, 6 do
+            local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
+            if glyphSpellID and glyphSpellID > 0 then
+                glyphs[socket] = {
+                    spellID   = glyphSpellID,
+                    icon      = icon,
+                    glyphType = glyphType,
+                }
+            end
         end
     end
 
+    local glyphCount = 0
+    for _ in pairs(glyphs) do glyphCount = glyphCount + 1 end
+    dprint(string.format("[RI] CollectData: done for '%s' – gs=%.0f gems=%s enchants=%s talents=%d/%d/%d glyphs=%d",
+        name, gs,
+        missingGems and "missing" or "ok", missingEnchants and "missing" or "ok",
+        talentData[1] or 0, talentData[2] or 0, talentData[3] or 0,
+        glyphCount))
     return {
         name      = name,
         class     = class,
@@ -639,6 +663,12 @@ end
 -- Inspect queue
 -- ============================================================
 
+-- Forward declaration so that scheduleNextInspect's closure can capture the
+-- NextInspect upvalue before the function body is assigned.  Without this,
+-- Lua would resolve the bare name 'NextInspect' as a global (_G.NextInspect),
+-- which is always nil, causing a runtime crash when the timer fires.
+local NextInspect
+
 -- Schedule the next inspection step after a short delay.
 -- Cancels any already-pending delay timer first so that only one
 -- NextInspect chain is ever active at a time.
@@ -652,36 +682,52 @@ local function scheduleNextInspect(delay)
     end, delay or 0.5)
 end
 
-local function NextInspect()
+NextInspect = function()
+    dprint(string.format("[RI] NextInspect called – queue=%d inspecting=%s", #inspQueue, tostring(inspecting)))
     if #inspQueue == 0 then
-        inspecting = nil
-        -- When the queue drains, send a group-wide data+glyph request if any
-        -- player was skipped (out of range) or had missing/changed data.
+        inspecting    = nil
+        inspectingGUID = nil
+        dprint("[RI] Queue empty – scan complete")
+        -- When the queue drains, send a group-wide data request if any player
+        -- was skipped (out of range) or had missing/changed data.
         if pendingCommRequest then
             pendingCommRequest = false
+            dprint("[RI] Sending deferred data comm request")
             RaidInspect:RequestData(true)   -- silent = true (no chat spam)
-            RaidInspect:RequestGlyphs(true)
         end
         return
     end
 
     local unit = table.remove(inspQueue, 1)
+    dprint(string.format("[RI] Processing unit '%s' (queue remaining: %d)", tostring(unit), #inspQueue))
 
     -- The local player is always accessible without a server-side inspect request.
     -- CanInspect returns false for yourself regardless of unit token, so bypass the
     -- queue mechanism.  The token may be "player" (solo/party) or "raidN" (raid group).
     if unit == "player" or UnitIsUnit(unit, "player") then
+        dprint("[RI] Unit is local player – collecting data directly")
         local data = CollectData("player")
         if data then
             cache[data.name] = data
             RaidInspect:RefreshTable()
+            dprint(string.format("[RI] Collected local player data for '%s'", tostring(data.name)))
+        else
+            dprint("[RI] CollectData returned nil for local player")
         end
-        -- Use the same inter-inspect delay as for other units.
-        scheduleNextInspect(0.5)
+        -- Minimum inter-inspect gap before the next player.
+        scheduleNextInspect(INTER_INSPECT_DELAY)
         return
     end
 
-    if not UnitExists(unit) or not CanInspect(unit) then
+    if not UnitExists(unit) then
+        dprint(string.format("[RI] Unit '%s' does not exist – skipping", tostring(unit)))
+        pendingCommRequest = true
+        scheduleNextInspect(0)
+        return
+    end
+
+    if not CheckInteractDistance(unit, 1) then
+        dprint(string.format("[RI] CheckInteractDistance('%s', 1) = false (out of range?) – skipping", tostring(unit)))
         -- Player is out of range or offline.  Flag a deferred comm request so
         -- that when the queue empties we ask group members running the addon to
         -- share their own data (covers the out-of-range case).
@@ -692,32 +738,62 @@ local function NextInspect()
         return
     end
 
-    inspecting = unit
-    NotifyInspect(unit)
+    inspecting    = unit
+    inspectingGUID = UnitGUID(unit)
+    -- When LibGroupTalents is available, route the inspect request through it.
+    -- LGT delegates to LibTalentQuery which serialises all NotifyInspect calls
+    -- across every addon using LGT, preventing duplicate inspect requests and
+    -- the server-side rate-limiting that comes from multiple addons each calling
+    -- NotifyInspect independently.  When LGT is absent, fall back to NotifyInspect.
+    -- On WotLK 3.3.5, NotifyInspect fires INSPECT_TALENT_READY (not INSPECT_READY)
+    -- and makes inventory link data available immediately; gem data arrives after
+    -- UNIT_INVENTORY_CHANGED.  We only listen for INSPECT_TALENT_READY.
+    if LGT then
+        dprint(string.format("[RI] Requesting inspect for '%s' via LGT (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        LGT:GetUnitTalents(unit, true)
+    else
+        dprint(string.format("[RI] Calling NotifyInspect on '%s' (GUID=%s)", tostring(unit), tostring(inspectingGUID)))
+        NotifyInspect(unit)
+    end
 
-    -- Failsafe timeout so we never get stuck
+    -- Failsafe timeout so we never get stuck if INSPECT_TALENT_READY never fires
+    -- (e.g. unit went offline mid-scan or the server throttled the request).
     if inspTimer then RaidInspect:CancelTimer(inspTimer) end
     inspTimer = RaidInspect:ScheduleTimer(function()
+        dprint(string.format("[RI] Inspect TIMEOUT for '%s' – moving on", tostring(inspecting)))
         ClearInspectPlayer()
-        inspecting = nil
-        NextInspect()
-    end, 5)
+        inspecting    = nil
+        inspectingGUID = nil
+        -- Use scheduleNextInspect rather than a direct call so that we honour
+        -- a small post-timeout gap before the next request, reducing the chance
+        -- of immediately hitting the same server throttle again.
+        scheduleNextInspect(POST_TIMEOUT_DELAY)
+    end, INSPECT_TIMEOUT)
 end
 
 local function Enqueue(unit)
-    if inspecting == unit then return end
-    for _, u in ipairs(inspQueue) do
-        if u == unit then return end
+    if inspecting == unit then
+        dprint(string.format("[RI] Enqueue('%s') – skipped, already inspecting", tostring(unit)))
+        return
     end
+    for _, u in ipairs(inspQueue) do
+        if u == unit then
+            dprint(string.format("[RI] Enqueue('%s') – skipped, already in queue", tostring(unit)))
+            return
+        end
+    end
+    dprint(string.format("[RI] Enqueue('%s') – added (queue size now %d)", tostring(unit), #inspQueue + 1))
     inspQueue[#inspQueue+1] = unit
 end
 
 function RaidInspect:ScanRaid()
     wipe(inspQueue)
     wipe(cache)
+    wipe(inspRetries)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
     if inspDelayTimer then self:CancelTimer(inspDelayTimer); inspDelayTimer = nil end
     inspecting         = nil
+    inspectingGUID     = nil
     pendingCommRequest = false
     self:RefreshTable()   -- immediately clear stale rows from any previous scan
 
@@ -779,49 +855,133 @@ end
 -- Event: inspection data ready
 -- ============================================================
 
-function RaidInspect:INSPECT_READY(_, guid)
-    if not inspecting then return end
-    if guid and guid ~= UnitGUID(inspecting) then return end
+-- Shared logic executed by INSPECT_TALENT_READY (or the LGT callback) once
+-- inspect data is confirmed to be ready for the unit we are waiting on.
+-- "source" is the triggering event name, used only in debug print messages.
+local function FinishInspect(source)
+    if inspTimer then RaidInspect:CancelTimer(inspTimer); inspTimer = nil end
 
-    if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
+    -- Save both the unit token and its GUID now; both will be nilled before we
+    -- finish, and the GUID is needed to validate the retry callback.
+    local unit      = inspecting
+    local savedGUID = inspectingGUID
 
-    local data = CollectData(inspecting)
+    local data = CollectData(unit)
     if data then
         local oldData = cache[data.name]
 
         -- Decide whether a group-wide comm request is needed for this player.
-        -- Request if: glyphs are missing after inspection, OR gear/talents
-        -- changed since the last scan (the remote data may have newer glyphs).
-        if not pendingCommRequest then
-            if not data.glyphs or not next(data.glyphs) then
+        -- Request if gear or talents changed since the last scan (the remote
+        -- data may have been updated by the player since we last saw them).
+        if not pendingCommRequest and oldData then
+            if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
+                dprint(string.format("[RI] %s – '%s' gearscore changed (%.0f→%.0f), flagging deferred comm request", source, tostring(data.name), oldData.gearscore or 0, data.gearscore or 0))
                 pendingCommRequest = true
-            elseif oldData then
-                if (oldData.gearscore or 0) ~= (data.gearscore or 0) then
-                    pendingCommRequest = true
-                elseif oldData.talentData and data.talentData then
-                    for i = 1, 3 do
-                        if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
-                            pendingCommRequest = true
-                            break
-                        end
+            elseif oldData.talentData and data.talentData then
+                for i = 1, 3 do
+                    if (oldData.talentData[i] or 0) ~= (data.talentData[i] or 0) then
+                        dprint(string.format("[RI] %s – '%s' talent tree %d changed, flagging deferred comm request", source, tostring(data.name), i))
+                        pendingCommRequest = true
+                        break
                     end
                 end
             end
         end
 
         cache[data.name] = data
-        self:RefreshTable()
+        RaidInspect:RefreshTable()
+
+        -- On private servers the first inspect event sometimes arrives before
+        -- item data is fully populated in the client cache.  If GetInventoryItemLink
+        -- returns nothing for every slot, the server hasn't pushed any item data yet.
+        -- Retry up to MAX_INSPECT_RETRIES times to give the server time to respond.
+        local hasItems = next(data.items) ~= nil
+        local needsRetry = not hasItems
+        if needsRetry then
+            local retries = inspRetries[data.name] or 0
+            if retries < MAX_INSPECT_RETRIES then
+                inspRetries[data.name] = retries + 1
+                dprint(string.format("[RI] %s – '%s' returned no item data – retry %d/%d",
+                    source, data.name, retries + 1, MAX_INSPECT_RETRIES))
+                -- Wait INSPECT_RETRY_DELAY seconds before re-inspecting to allow the
+                -- item cache to populate on the server side.  Validate the unit token
+                -- still maps to the same player before re-enqueueing (roster may shift).
+                RaidInspect:ScheduleTimer(function()
+                    if UnitGUID(unit) == savedGUID then
+                        Enqueue(unit)
+                        if not inspecting and not inspDelayTimer then NextInspect() end
+                    end
+                end, INSPECT_RETRY_DELAY)
+            end
+        else
+            inspRetries[data.name] = nil  -- good item data: reset counter
+        end
+    else
+        dprint(string.format("[RI] %s – CollectData returned nil for '%s'", source, tostring(unit)))
     end
 
     ClearInspectPlayer()
-    inspecting = nil
+    inspecting    = nil
+    inspectingGUID = nil
 
-    -- Small delay between inspects to respect server throttling
-    scheduleNextInspect(0.5)
+    -- Minimum inter-inspect gap before the next player.
+    scheduleNextInspect(INTER_INSPECT_DELAY)
+end
+
+-- On WotLK 3.3.5, NotifyInspect fires INSPECT_TALENT_READY (not INSPECT_READY —
+-- that event is Cataclysm+).  INSPECT_TALENT_READY carries no GUID argument, so
+-- we validate using the GUID captured at NotifyInspect time.
+-- When LGT is available it fires LibGroupTalents_Update before this handler
+-- runs (LibTalentQuery was loaded earlier), so this only acts as a fallback
+-- for the LGT-less code path.
+function RaidInspect:INSPECT_TALENT_READY()
+    dprint(string.format("[RI] INSPECT_TALENT_READY fired – inspecting=%s", tostring(inspecting)))
+    if not inspecting then
+        dprint("[RI] INSPECT_TALENT_READY – no active inspection, ignoring")
+        return
+    end
+    -- Validate the unit token still refers to the player we requested.
+    if inspectingGUID and UnitGUID(inspecting) ~= inspectingGUID then
+        dprint(string.format("[RI] INSPECT_TALENT_READY – GUID mismatch (expected %s, got %s), ignoring", tostring(inspectingGUID), tostring(UnitGUID(inspecting))))
+        return
+    end
+    FinishInspect("INSPECT_TALENT_READY")
 end
 
 -- ============================================================
--- AceComm: glyph request / response
+-- LibGroupTalents callbacks
+-- ============================================================
+
+-- Fired by LGT when fresh talent data arrives for any roster member.
+-- When it matches the unit we are currently waiting on, it drives FinishInspect
+-- instead of the raw INSPECT_TALENT_READY event, so only ONE NotifyInspect per
+-- player is ever issued (via LibTalentQuery's serialised inspect queue).
+function RaidInspect:OnLGTUpdate(_, guid, unit)
+    if not inspecting or guid ~= inspectingGUID then return end
+    dprint(string.format("[RI] LibGroupTalents_Update – '%s' GUID=%s matches, finishing inspect", tostring(unit), tostring(guid)))
+    FinishInspect("LGT:Update")
+end
+
+-- Fired by LGT when glyph data arrives for a group member via LGT's own comm
+-- protocol (independent of our inspect buffer).  Update the cache entry and
+-- refresh the table so the talent hover frame shows the latest glyphs.
+function RaidInspect:OnLGTGlyphUpdate(_, guid, unit)
+    if not unit or not guid then return end
+    local name, realm = UnitName(unit)
+    if realm and realm ~= "" then name = name.."-"..realm end
+    if not name or name == "Unknown" then return end
+    local data = cache[name]
+    if not data then return end
+    local newGlyphs = GlyphsFromLGT(unit)
+    if newGlyphs then
+        data.glyphs = newGlyphs
+        dprint(string.format("[RI] LibGroupTalents_GlyphUpdate – updated glyphs for '%s'", name))
+        self:RefreshTable()
+    end
+end
+
+-- ============================================================
+-- AceComm: data request / response (for out-of-range players)
 -- ============================================================
 
 function RaidInspect:OnCommReceived(prefix, message, _, sender)
@@ -829,23 +989,7 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
 
     local AceSerializer = LibStub("AceSerializer-3.0")
 
-    if message == GLYPH_REQ_MSG then
-        -- Respond with our own glyph data
-        local myGlyphs = {}
-        for socket = 1, 6 do
-            local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
-            if glyphSpellID and glyphSpellID > 0 then
-                myGlyphs[socket] = {
-                    spellID   = glyphSpellID,
-                    icon      = icon,
-                    glyphType = glyphType,
-                }
-            end
-        end
-        local payload = AceSerializer:Serialize(GLYPH_RESP_MSG, myGlyphs)
-        self:SendCommMessage(COMM_PREFIX, payload, "WHISPER", sender)
-
-    elseif message == DATA_REQ_MSG then
+    if message == DATA_REQ_MSG then
         -- Respond with our own complete gear / talent / glyph data so that the
         -- requester can inspect us even when we are out of their inspect range.
         local myData = CollectData("player")
@@ -866,23 +1010,11 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
         end
 
     else
-        -- Try to deserialise as a glyph response or a full data response
+        -- Try to deserialise as a full data response
         local ok, msgType, payload = AceSerializer:Deserialize(message)
         if not ok then return end
 
-        if msgType == GLYPH_RESP_MSG then
-            -- Match sender to a cache entry (strip realm suffix for comparison)
-            local senderBase = sender:match("^([^%-]+)") or sender
-            for name, data in pairs(cache) do
-                local nameBase = name:match("^([^%-]+)") or name
-                if nameBase:lower() == senderBase:lower() then
-                    data.glyphs = payload
-                    self:RefreshTable()
-                    break
-                end
-            end
-
-        elseif msgType == DATA_RESP_MSG then
+        if msgType == DATA_RESP_MSG then
             -- Full player data response — merge into cache.
             -- The sender reports their OWN data, so it is authoritative.
             local incoming = payload
@@ -901,16 +1033,6 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
             end
             self:RefreshTable()
         end
-    end
-end
-
--- silent suppresses the chat confirmation (used for auto-triggered requests)
-function RaidInspect:RequestGlyphs(silent)
-    local numRaid = GetNumRaidMembers()
-    local channel = numRaid > 0 and "RAID" or "PARTY"
-    self:SendCommMessage(COMM_PREFIX, GLYPH_REQ_MSG, channel)
-    if not silent then
-        self:Print("Requested glyph data from raid/party members running RaidInspect.")
     end
 end
 
@@ -1103,6 +1225,7 @@ local function ShowPaperdollHover(anchor, data)
 
     paperdollFrame:ClearAllPoints()
     paperdollFrame:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    paperdollFrame:SetScale(RaidInspect.db and RaidInspect.db.profile.itemFrameScale or 1.0)
     paperdollFrame:Show()
     paperdollFrame:Raise()
 end
@@ -1362,6 +1485,7 @@ local function ShowTalentHover(anchor, data)
     -- Position the frame
     f:ClearAllPoints()
     f:SetPoint("TOPLEFT", anchor, "TOPRIGHT", 4, 0)
+    f:SetScale(RaidInspect.db and RaidInspect.db.profile.talentFrameScale or 1.0)
     f:Show()
     f:Raise()
 end
@@ -1452,13 +1576,6 @@ local function CreateRow(parent, rowIndex)
     row.talText = talText
     x = x + COL_TALENTS
 
-    -- Spec-acceptable icon
-    local specTex = row:CreateTexture(nil, "OVERLAY")
-    specTex:SetSize(COL_SPEC - 4, ROW_H - 2)
-    specTex:SetPoint("LEFT", row, "LEFT", x + 2, 0)
-    row.specTex = specTex
-    x = x + COL_SPEC
-
     -- Gemmed icon
     local gemTex = row:CreateTexture(nil, "OVERLAY")
     gemTex:SetSize(COL_GEMMED - 4, ROW_H - 2)
@@ -1521,20 +1638,6 @@ local function PopulateRow(row, data)
     row.talBtn:SetScript("OnEnter", function(btn) ShowTalentHover(btn, data) end)
     row.talBtn:SetScript("OnLeave", HideTalentHover)
 
-    -- Spec acceptable — combine the coarse spec-tree check with the
-    -- per-talent filter check; if only one is configured, use that one.
-    local specOk   = IsSpecAcceptable(data.class, data.talentData)
-    local filterOk = IsTalentFilterSatisfied(data.class, data.talentPoints)
-    local acceptable
-    if specOk ~= nil and filterOk ~= nil then
-        acceptable = specOk and filterOk
-    elseif specOk ~= nil then
-        acceptable = specOk
-    else
-        acceptable = filterOk  -- may still be nil when neither is configured
-    end
-    SetStatusIcon(row.specTex, acceptable)
-
     -- Gemmed
     SetStatusIcon(row.gemTex, data.gemmed)
 
@@ -1542,112 +1645,6 @@ local function PopulateRow(row, data)
     SetStatusIcon(row.enchTex, data.enchanted)
 
     row:Show()
-end
-
--- ============================================================
--- Talent filter editor
--- ============================================================
-
--- Reusable popup window that hosts the MiniTalentWidget.
--- One instance is kept alive for the session; switching classes reuses it.
-local talentEditorWindow = nil
-local talentEditorWidget = nil
-
-function RaidInspect:OpenTalentFilterEditor(class)
-    -- One-time creation of the popup window
-    if not talentEditorWindow then
-        local win = CreateFrame("Frame", "RaidInspect_TalentEditor", UIParent)
-        ns.SetFlat(win)
-        win:SetSize(510, 500)
-        win:SetPoint("CENTER")
-        win:SetMovable(true)
-        win:SetClampedToScreen(true)
-        win:EnableMouse(true)
-        win:RegisterForDrag("LeftButton")
-        win:SetScript("OnDragStart", function(w) w:StartMoving() end)
-        win:SetScript("OnDragStop",  function(w) w:StopMovingOrSizing() end)
-        win:SetToplevel(true)
-        win:SetFrameStrata("DIALOG")
-
-        local titleText = win:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        titleText:SetPoint("TOP", win, "TOP", 0, -10)
-        titleText:SetTextColor(unpack(ns.C.gold))
-        win.titleText = titleText
-
-        local closeBtn = CreateFrame("Button", nil, win, "UIPanelCloseButton")
-        closeBtn:SetPoint("TOPRIGHT", win, "TOPRIGHT", -2, -2)
-        closeBtn:SetScript("OnClick", function() win:Hide() end)
-        ns.SkinCloseButton(closeBtn)
-
-        local hint = win:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        hint:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", 14, 10)
-        hint:SetText("Click: Yellow = required  |  Red = excluded  |  Dim = any")
-        hint:SetTextColor(0.7, 0.7, 0.7, 1)
-
-        -- Message shown when no talent data is loaded for the selected class
-        local noDataMsg = win:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        noDataMsg:SetPoint("CENTER", win, "CENTER", 0, 0)
-        noDataMsg:SetJustifyH("CENTER")
-        noDataMsg:SetTextColor(0.6, 0.6, 0.6, 1)
-        noDataMsg:Hide()
-        win.noDataMsg = noDataMsg
-
-        -- Create the talent widget and reparent it into our window
-        local AceGUI = LibStub("AceGUI-3.0")
-        local w = AceGUI:Create("AuraTrackerMiniTalent")
-        w:SetCallback("OnValueChanged", function(widget, idx, state, talentName)
-            local cls = widget.class
-            if not cls or not talentName then return end
-            if not RaidInspect.db.profile.talentFilters[cls] then
-                RaidInspect.db.profile.talentFilters[cls] = {}
-            end
-            local tbl = RaidInspect.db.profile.talentFilters[cls]
-            if state ~= nil then
-                tbl[talentName] = state
-            else
-                tbl[talentName] = nil
-                if not next(tbl) then
-                    RaidInspect.db.profile.talentFilters[cls] = nil
-                end
-            end
-            RaidInspect:RefreshTable()
-        end)
-
-        -- Embed the talent frame inside our window
-        w.frame:SetParent(win)
-        w.frame:ClearAllPoints()
-        -- Leave room above for the title (≈30 px) plus the toggle/dropdown row
-        -- that sits 24 px above the talent frame itself.
-        w.frame:SetPoint("TOPLEFT", win, "TOPLEFT", 36, -64)
-
-        talentEditorWindow = win
-        talentEditorWidget = w
-    end
-
-    -- Update window title and switch to the requested class
-    local displayName = CLASS_LOCAL_NAMES[class] or class
-    talentEditorWindow.titleText:SetText("Talent Filters — " .. displayName)
-
-    talentEditorWidget:SetClass(class)
-
-    -- Show or hide the "no data" message
-    local hasData = LGT and LGT.classTalentData and LGT.classTalentData[class]
-    if hasData then
-        talentEditorWindow.noDataMsg:Hide()
-    else
-        talentEditorWindow.noDataMsg:SetFormattedText(
-            "No talent data loaded for %s.\n"
-            .. "Inspect a %s player in-game\nto populate this tree.",
-            displayName, displayName)
-        talentEditorWindow.noDataMsg:Show()
-    end
-
-    -- Restore previously saved filter states for this class
-    local filters = self.db.profile.talentFilters[class] or {}
-    talentEditorWidget:RestoreValues(filters)
-
-    talentEditorWindow:Show()
-    talentEditorWindow:Raise()
 end
 
 -- ============================================================
@@ -1661,7 +1658,6 @@ local function CreateHeaderRow(parent)
         {label="GS",         w=COL_GS},
         {label="Items",      w=COL_ITEMS},
         {label="Talents",    w=COL_TALENTS},
-        {label="Spec",       w=COL_SPEC},
         {label="Gem",        w=COL_GEMMED},
         {label="Ench",       w=COL_ENCHANTED},
     }
@@ -1722,48 +1718,71 @@ function RaidInspect:CreateMainFrame()
     scanBtn:SetScript("OnClick", function() RaidInspect:ScanRaid() end)
     ns.SkinFlatButton(scanBtn)
 
-    -- Config button
-    local cfgBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    cfgBtn:SetSize(70, 22)
-    cfgBtn:SetPoint("LEFT", scanBtn, "RIGHT", 4, 0)
-    cfgBtn:SetText("Config")
-    cfgBtn:SetScript("OnClick", function()
-        LibStub("AceConfigDialog-3.0"):Open(addonName)
-    end)
-    ns.SkinFlatButton(cfgBtn)
-
-    -- Glyph-request button
-    local glyphBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    glyphBtn:SetSize(110, 22)
-    glyphBtn:SetPoint("LEFT", cfgBtn, "RIGHT", 4, 0)
-    glyphBtn:SetText("Request Glyphs")
-    glyphBtn:SetScript("OnClick", function() RaidInspect:RequestGlyphs() end)
-    ns.SkinFlatButton(glyphBtn)
-
     -- Request Data button — asks out-of-range addon users to share their
     -- gear, talent, and glyph data via AceComm.
     local dataBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     dataBtn:SetSize(100, 22)
-    dataBtn:SetPoint("LEFT", glyphBtn, "RIGHT", 4, 0)
+    dataBtn:SetPoint("LEFT", scanBtn, "RIGHT", 4, 0)
     dataBtn:SetText("Request Data")
     dataBtn:SetScript("OnClick", function() RaidInspect:RequestData() end)
     ns.SkinFlatButton(dataBtn)
 
-    -- Column header row
+    -- Scale sliders — a second compact row below the main buttons.
+    -- Each slider adjusts the scale of the corresponding hover frame (0.5 – 2.0).
+    local function MakeScaleSlider(labelText, xAnchor, initKey)
+        local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lbl:SetText(labelText)
+        -- Align the label vertically centred within the scale-slider row.
+        -- HEADER_H (22px) matches the button height of the first row (scanBtn/dataBtn).
+        lbl:SetPoint("TOPLEFT", xAnchor, "BOTTOMLEFT", 0, -(SCALE_ROW_H - HEADER_H) / 2 - 4)
+
+        local sliderName = "RaidInspect_ScaleSlider_" .. initKey
+        local sl = CreateFrame("Slider", sliderName, f, "OptionsSliderTemplate")
+        sl:SetSize(110, 16)
+        sl:SetPoint("LEFT", lbl, "RIGHT", 6, 0)
+        sl:SetMinMaxValues(0.5, 2.0)
+        sl:SetValueStep(0.05)
+
+        local initVal = RaidInspect.db and RaidInspect.db.profile[initKey] or 1.0
+        sl:SetValue(initVal)
+
+        -- Replace the template's default "Low"/"High"/"Label" strings
+        local lo  = _G[sliderName .. "Low"]
+        local hi  = _G[sliderName .. "High"]
+        local txt = _G[sliderName .. "Text"]
+        if lo  then lo:SetText("0.5") end
+        if hi  then hi:SetText("2.0") end
+        if txt then txt:SetText(string.format("%.2f", initVal)) end
+
+        sl:SetScript("OnValueChanged", function(self, val)
+            -- Snap to the nearest 0.05 step (20 = 1/0.05, the number of steps per unit).
+            val = math.floor(val * 20 + 0.5) / 20
+            if txt then txt:SetText(string.format("%.2f", val)) end
+            if RaidInspect.db then
+                RaidInspect.db.profile[initKey] = val
+            end
+        end)
+        return sl
+    end
+
+    MakeScaleSlider("Item Scale:",   scanBtn, "itemFrameScale")
+    MakeScaleSlider("Talent Scale:", dataBtn, "talentFrameScale")
+
+    -- Column header row (pushed down to make room for the scale slider row)
     local headerRow = CreateHeaderRow(f)
-    headerRow:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -34)
+    headerRow:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -34 - SCALE_ROW_H)
 
     -- Separator line under headers
     local sep = f:CreateTexture(nil, "ARTWORK")
     sep:SetHeight(1)
     sep:SetTexture(0.3, 0.3, 0.3, 1)
-    sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  12, -34 - HEADER_H)
-    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -34 - HEADER_H)
+    sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  12, -34 - SCALE_ROW_H - HEADER_H)
+    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -28, -34 - SCALE_ROW_H - HEADER_H)
 
     -- Scroll frame
     local sf = CreateFrame("ScrollFrame", "RaidInspect_ScrollFrame",
                            f, "UIPanelScrollFrameTemplate")
-    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  12, -34 - HEADER_H - 4)
+    sf:SetPoint("TOPLEFT",     f, "TOPLEFT",  12, -34 - SCALE_ROW_H - HEADER_H - 4)
     sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 10)
 
     local sc = CreateFrame("Frame", nil, sf)
@@ -1820,102 +1839,11 @@ function RaidInspect:ToggleWindow()
 end
 
 -- ============================================================
--- AceConfig options table
--- ============================================================
-
-function RaidInspect:GetOptions()
-    -- Build per-class spec-toggle groups
-    local specArgs = {}
-    for i, class in ipairs(CLASS_ORDER) do
-        local ci        = class          -- capture for all closures in this iteration
-        local specNames = CLASS_SPEC_NAMES[class] or {}
-        local classArgs = {}
-        for si, sname in ipairs(specNames) do
-            local sii = si               -- capture inner loop variable
-            classArgs["spec"..si] = {
-                order = si,
-                type  = "toggle",
-                name  = sname,
-                desc  = "Mark "..sname.." as an acceptable spec for "
-                        ..(CLASS_LOCAL_NAMES[class] or class).."s",
-                get   = function()
-                    local t = self.db.profile.acceptableSpecs[ci]
-                    return t and t[sii] or false
-                end,
-                set   = function(_, val)
-                    if not self.db.profile.acceptableSpecs[ci] then
-                        self.db.profile.acceptableSpecs[ci] = {}
-                    end
-                    -- Store true when checked; remove (nil) when unchecked so
-                    -- that a class with all specs unchecked reverts to "neutral"
-                    -- (no requirement) rather than "all specs unacceptable".
-                    self.db.profile.acceptableSpecs[ci][sii] = val and true or nil
-                    self:RefreshTable()
-                end,
-            }
-        end
-        -- Button to open the per-talent filter editor for this class
-        classArgs["editTalentFilters"] = {
-            order = 99,
-            type  = "execute",
-            name  = "Edit Talent Filters",
-            desc  = "Open the per-talent filter editor for "
-                    .. (CLASS_LOCAL_NAMES[ci] or ci) .. "s.\n"
-                    .. "Yellow = required talent  |  Red = excluded talent",
-            func  = function()
-                RaidInspect:OpenTalentFilterEditor(ci)
-            end,
-        }
-        specArgs[class] = {
-            order  = i,
-            type   = "group",
-            name   = CLASS_LOCAL_NAMES[class] or class,
-            inline = true,
-            args   = classArgs,
-        }
-    end
-
-    return {
-        name    = addonName,
-        handler = self,
-        type    = "group",
-        args    = {
-            gsThreshold = {
-                order = 1,
-                type  = "range",
-                name  = "GearScore Threshold",
-                desc  = "Minimum GearScore displayed with a green colour in the table",
-                min   = 0, max = 6000, step = 10,
-                get   = function() return self.db.profile.gsThreshold end,
-                set   = function(_, val)
-                    self.db.profile.gsThreshold = val
-                    self:RefreshTable()
-                end,
-            },
-            acceptableSpecs = {
-                order  = 2,
-                type   = "group",
-                name   = "Acceptable Specs",
-                desc   = "Per-class list of specs that satisfy the spec requirement",
-                inline = false,
-                args   = specArgs,
-            },
-            profiles = LibStub("AceDBOptions-3.0"):GetOptionsTable(self.db),
-        },
-    }
-end
-
--- ============================================================
 -- Lifecycle
 -- ============================================================
 
 function RaidInspect:OnInitialize()
     self.db = LibStub("AceDB-3.0"):New("RaidInspectDB", defaults, true)
-
-    LibStub("AceConfig-3.0"):RegisterOptionsTable(addonName, function()
-        return self:GetOptions()
-    end)
-    LibStub("AceConfigDialog-3.0"):AddToBlizOptions(addonName, addonName)
 
     self:RegisterChatCommand("raidinspect", "SlashCommand")
     self:RegisterChatCommand("ri", "SlashCommand")
@@ -1924,20 +1852,39 @@ function RaidInspect:OnInitialize()
 end
 
 function RaidInspect:OnEnable()
-    self:RegisterEvent("INSPECT_READY")
+    -- On WotLK 3.3.5, INSPECT_READY does not fire — only INSPECT_TALENT_READY does.
+    -- (INSPECT_READY was introduced in Cataclysm.)  Register only INSPECT_TALENT_READY.
+    -- When LGT is available, LibGroupTalents_Update fires first (because
+    -- LibTalentQuery was loaded before us), making this handler act as a fallback
+    -- for the LGT-less code path only.
+    self:RegisterEvent("INSPECT_TALENT_READY")
+    -- Hook into LibGroupTalents so we can piggyback on its unified inspect
+    -- queue rather than issuing duplicate NotifyInspect calls ourselves.
+    if LGT then
+        LGT.RegisterCallback(self, "LibGroupTalents_Update",      "OnLGTUpdate")
+        LGT.RegisterCallback(self, "LibGroupTalents_GlyphUpdate", "OnLGTGlyphUpdate")
+    end
     -- Automatically re-scan whenever the group roster changes so that new
     -- members are inspected without requiring a manual /ri scan.
     self:RegisterEvent("RAID_ROSTER_UPDATE")
     self:RegisterEvent("PARTY_MEMBERS_CHANGED")
-    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri glyphs · /ri data · /ri config")
+    self:Print("RaidInspect ready. /ri to open · /ri scan · /ri data")
+    -- If we are already in a group when the addon loads, kick off scanning
+    -- immediately without waiting for a roster-change event or manual /ri scan.
+    self:AutoScan()
 end
 
 function RaidInspect:OnDisable()
+    if LGT then
+        LGT.UnregisterAllCallbacks(self)
+    end
     wipe(cache)
     wipe(inspQueue)
+    wipe(inspRetries)
     if inspTimer then self:CancelTimer(inspTimer); inspTimer = nil end
     if inspDelayTimer then self:CancelTimer(inspDelayTimer); inspDelayTimer = nil end
     inspecting         = nil
+    inspectingGUID     = nil
     pendingCommRequest = false
 end
 
@@ -1954,10 +1901,6 @@ function RaidInspect:SlashCommand(input)
     local cmd = strtrim(input or ""):lower()
     if cmd == "scan" then
         self:ScanRaid()
-    elseif cmd == "config" then
-        LibStub("AceConfigDialog-3.0"):Open(addonName)
-    elseif cmd == "glyphs" then
-        self:RequestGlyphs()
     elseif cmd == "data" then
         self:RequestData()
     else
