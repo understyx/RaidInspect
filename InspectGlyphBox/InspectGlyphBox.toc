@@ -1,0 +1,12 @@
+## Interface: 30300
+## Title: InspectGlyphBox
+## Notes: Shows a simple text box with the current target's glyphs.
+## Version: 1.0.0
+
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+Libs\ChatThrottleLib\ChatThrottleLib.lua
+Libs\LibGroupTalents-1.0\LibTalentQuery-1.0.lua
+Libs\LibGroupTalents-1.0\LibGroupTalents-1.0.lua
+
+InspectGlyphBox.lua
