@@ -598,33 +598,25 @@ local function CollectData(unit)
     end
 
     -- Glyph data (major + minor, sockets 1-6).
-    -- For non-local players, prefer LGT's stored glyph data (received via
-    -- LGT's own comm protocol, which is more reliable than the inspect buffer
-    -- on private servers where GetGlyphSocketInfo with isnotplayer=true can
-    -- return the local player's own glyphs instead of the inspected player's).
-    -- Fall back to the inspect buffer only when LGT has no data for this unit.
-    -- For the local player, always read directly from the API.
+    -- For non-local players, use LGT's stored glyph data exclusively.
+    -- The inspect buffer (GetGlyphSocketInfo with isnotplayer=true) is NOT
+    -- used as a fallback because on many private WotLK servers it returns the
+    -- local player's own glyphs instead of the inspected player's glyphs.
+    -- glyphsKnown = true  → reliable data (LGT or local API)
+    -- glyphsKnown = false → LGT had no data yet; "No data" is shown in the UI
     -- glyphType == 1 → Major glyph; glyphType == 2 → Minor glyph
     local glyphs = {}
+    local glyphsKnown
     if isnotplayer then
         local lgtGlyphs = GlyphsFromLGT(unit)
         if lgtGlyphs then
-            glyphs = lgtGlyphs
+            glyphs     = lgtGlyphs
+            glyphsKnown = true
         else
-            -- Fallback: inspect buffer (may not be accurate on all servers)
-            for socket = 1, 6 do
-                local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket, 1, true)
-                if glyphSpellID and glyphSpellID > 0 then
-                    glyphs[socket] = {
-                        spellID   = glyphSpellID,
-                        icon      = icon,
-                        glyphType = glyphType,
-                    }
-                end
-            end
+            glyphsKnown = false
         end
     else
-        -- Local player: read directly
+        -- Local player: read directly from the API (always reliable)
         for socket = 1, 6 do
             local _, glyphType, glyphSpellID, icon = GetGlyphSocketInfo(socket)
             if glyphSpellID and glyphSpellID > 0 then
@@ -635,6 +627,7 @@ local function CollectData(unit)
                 }
             end
         end
+        glyphsKnown = true
     end
 
     local glyphCount = 0
@@ -655,6 +648,7 @@ local function CollectData(unit)
         talentData   = talentData,
         talentPoints = talentPoints,
         glyphs    = glyphs,
+        glyphsKnown = glyphsKnown,
         timestamp = GetTime(),
     }
 end
@@ -974,7 +968,8 @@ function RaidInspect:OnLGTGlyphUpdate(_, guid, unit)
     if not data then return end
     local newGlyphs = GlyphsFromLGT(unit)
     if newGlyphs then
-        data.glyphs = newGlyphs
+        data.glyphs     = newGlyphs
+        data.glyphsKnown = true
         dprint(string.format("[RI] LibGroupTalents_GlyphUpdate – updated glyphs for '%s'", name))
         self:RefreshTable()
     end
@@ -1005,6 +1000,7 @@ function RaidInspect:OnCommReceived(prefix, message, _, sender)
                 talentData   = myData.talentData,
                 talentPoints = myData.talentPoints,
                 glyphs       = myData.glyphs,
+                glyphsKnown  = myData.glyphsKnown,
             })
             self:SendCommMessage(COMM_PREFIX, payload, "WHISPER", sender)
         end
@@ -1436,35 +1432,58 @@ local function ShowTalentHover(anchor, data)
                        + maxTier * TALHOV_SPC
 
     -- Populate glyph section
-    local glyphCount = 0
-    if data.glyphs and next(data.glyphs) then
-        for socket = 1, 6 do
-            local g = data.glyphs[socket]
-            if g then
-                local spellName = GetSpellInfo(g.spellID)
-                if spellName then
-                    glyphCount = glyphCount + 1
-                    local lfs = f.glyphLines[glyphCount]
-                    if lfs then
-                        local typeStr = (g.glyphType == 1)
-                            and "|cffffcc00[Major]|r"
-                            or  "|cff99ccff[Minor]|r"
-                        lfs:SetText("  " .. typeStr .. " " .. spellName)
-                        lfs:SetPoint("TOPLEFT", f, "TOPLEFT",
-                            TALHOV_LPAD,
-                            -(treeSectionH + TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH
-                              + (glyphCount - 1) * TALHOV_GLYPH_LH))
-                        lfs:Show()
+    local glyphCount    = 0
+    local showGlyphSection = false
+
+    if data.glyphsKnown == false then
+        -- LGT had no data for this player yet — display a placeholder so the
+        -- user knows glyphs exist but haven't been received, rather than
+        -- silently showing nothing (or worse, showing the local player's glyphs
+        -- from the unreliable inspect buffer).
+        showGlyphSection = true
+        local lfs = f.glyphLines[1]
+        if lfs then
+            lfs:SetText("  |cffaaaaaa(No data)|r")
+            lfs:SetPoint("TOPLEFT", f, "TOPLEFT",
+                TALHOV_LPAD,
+                -(treeSectionH + TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH))
+            lfs:Show()
+        end
+        glyphCount = 1
+        for i = 2, 6 do
+            if f.glyphLines[i] then f.glyphLines[i]:Hide() end
+        end
+    else
+        if data.glyphs and next(data.glyphs) then
+            showGlyphSection = true
+            for socket = 1, 6 do
+                local g = data.glyphs[socket]
+                if g then
+                    local spellName = GetSpellInfo(g.spellID)
+                    if spellName then
+                        glyphCount = glyphCount + 1
+                        local lfs = f.glyphLines[glyphCount]
+                        if lfs then
+                            local typeStr = (g.glyphType == 1)
+                                and "|cffffcc00[Major]|r"
+                                or  "|cff99ccff[Minor]|r"
+                            lfs:SetText("  " .. typeStr .. " " .. spellName)
+                            lfs:SetPoint("TOPLEFT", f, "TOPLEFT",
+                                TALHOV_LPAD,
+                                -(treeSectionH + TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH
+                                  + (glyphCount - 1) * TALHOV_GLYPH_LH))
+                            lfs:Show()
+                        end
                     end
                 end
             end
         end
-    end
-    for i = glyphCount + 1, 6 do
-        if f.glyphLines[i] then f.glyphLines[i]:Hide() end
+        for i = glyphCount + 1, 6 do
+            if f.glyphLines[i] then f.glyphLines[i]:Hide() end
+        end
     end
 
-    if glyphCount > 0 then
+    if showGlyphSection then
         f.glyphSep:SetPoint("TOPLEFT",  f, "TOPLEFT",  TALHOV_LPAD,  -treeSectionH)
         f.glyphSep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -TALHOV_LPAD, -treeSectionH)
         f.glyphTitleFS:SetPoint("TOPLEFT", f, "TOPLEFT",
@@ -1477,7 +1496,7 @@ local function ShowTalentHover(anchor, data)
     end
 
     -- Resize frame to fit content
-    local glyphH = (glyphCount > 0)
+    local glyphH = showGlyphSection
         and (TALHOV_GLYPH_SEP + TALHOV_GLYPH_LH + glyphCount * TALHOV_GLYPH_LH + TALHOV_LPAD)
         or  TALHOV_LPAD
     f:SetHeight(treeSectionH + glyphH)
